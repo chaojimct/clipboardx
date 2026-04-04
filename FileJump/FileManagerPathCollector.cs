@@ -484,51 +484,140 @@ internal static class FileManagerPathCollector
     }
 
     /// <summary>
-    /// 通过 Shell.Application.Windows 取资源管理器路径。COM 报告的 HWND 常与顶层 CabinetWClass 不完全相同，
-    /// 故用 GetAncestor / IsChild / 父链匹配（对齐 QuickSwitch 的 <c>_Exp.hwnd</c> 实测差异）。
+    /// 通过 Shell.Application.Windows 取资源管理器路径；COM 失败时 UIA 与「文件夹跳转」读取对话框当前目录同源：
+    /// <see cref="FileDialogJumpHelper.TryReadCurrentFolder(System.IntPtr,out string,bool)"/>（<c>relaxed: true</c>）。
     /// </summary>
     private static string? TryGetExplorerPathForHwnd(IntPtr explorerFrameHwnd)
     {
         if (explorerFrameHwnd == IntPtr.Zero) return null;
         Type? t = Type.GetTypeFromProgID("Shell.Application");
-        if (t == null) return null;
         object? shell = null;
         object? windows = null;
+        string? comPath = null;
         try
         {
-            shell = Activator.CreateInstance(t);
-            if (shell == null) return null;
-            windows = TryInvokeShellWindows(shell);
-            if (windows == null) return null;
-
-            var wt = windows.GetType();
-            var countObj = wt.InvokeMember("Count", BindingFlags.GetProperty, null, windows, null);
-            var count = Convert.ToInt32(countObj);
-            for (var i = 0; i < count; i++)
+            if (t != null)
             {
-                object? win = null;
-                try
+                shell = Activator.CreateInstance(t);
+                if (shell != null)
                 {
-                    win = wt.InvokeMember("Item", BindingFlags.InvokeMethod, null, windows, new object[] { i });
-                    if (win == null) continue;
-                    var comHwnd = TryGetInternetExplorerHwnd(win);
-                    if (!ExplorerFrameLikelyMatches(explorerFrameHwnd, comHwnd)) continue;
-                    return ReadShellWindowPath(win);
-                }
-                finally
-                {
-                    if (win != null) Marshal.ReleaseComObject(win);
+                    windows = TryInvokeShellWindows(shell);
+                    if (windows != null)
+                    {
+                        var wt = windows.GetType();
+                        var countObj = wt.InvokeMember("Count", BindingFlags.GetProperty, null, windows, null);
+                        var count = Convert.ToInt32(countObj);
+                        var bestScore = int.MinValue;
+                        for (var i = 0; i < count; i++)
+                        {
+                            object? win = null;
+                            try
+                            {
+                                win = wt.InvokeMember("Item", BindingFlags.InvokeMethod, null, windows, new object[] { i });
+                                if (win == null) continue;
+                                var comHwnd = TryGetInternetExplorerHwnd(win);
+                                var score = ExplorerComMatchScore(explorerFrameHwnd, comHwnd);
+                                if (score < 0 || score < bestScore) continue;
+                                var path = ReadShellWindowPath(win);
+                                if (string.IsNullOrEmpty(path)) continue;
+                                if (score > bestScore)
+                                {
+                                    bestScore = score;
+                                    comPath = path;
+                                }
+                                // Win11 多标签/多 Shell 项可能同分：原先只保留首个，易留下另一标签的 C:\ 等错误路径。
+                                else if (score == bestScore
+                                         && (string.IsNullOrEmpty(comPath) || path.Length > comPath!.Length))
+                                {
+                                    comPath = path;
+                                }
+                            }
+                            finally
+                            {
+                                if (win != null) Marshal.ReleaseComObject(win);
+                            }
+                        }
+                    }
                 }
             }
         }
-        catch { return null; }
+        catch { /* COM 失败时仍可与 UIA 合并 */ }
         finally
         {
             if (windows != null) Marshal.ReleaseComObject(windows);
             if (shell != null) Marshal.ReleaseComObject(shell);
         }
 
-        return null;
+        string? uiaPath = null;
+        // 旧逻辑 COM 成功即 return，从不会扫 Cabinet；合并后每次都跑 UIA。Win11 上偶发 ElementNotAvailable 等会中断整段，导致即使有 COM 路径弹窗也起不来。
+        try
+        {
+            if (FileDialogJumpHelper.TryReadCurrentFolder(explorerFrameHwnd, out var jumpStyle, relaxed: true)
+                && !string.IsNullOrEmpty(jumpStyle))
+                uiaPath = jumpStyle;
+        }
+        catch { /* ignore */ }
+
+        // Shell.Document 与前台地址栏在 Win11 上可能不一致；曾提早 return comPath 导致界面在 D:\gn 仍显示 C:\。
+        try
+        {
+            return MergeExplorerComPathWithUiPath(comPath, uiaPath);
+        }
+        catch
+        {
+            if (!string.IsNullOrEmpty(uiaPath)) return uiaPath;
+            return comPath;
+        }
+    }
+
+    /// <summary>COM 路径与 UIA（与文件夹跳转同源）合并：盘符根误报、多标签错项时以界面为准。</summary>
+    private static string? MergeExplorerComPathWithUiPath(string? comPath, string? uiaPath)
+    {
+        if (string.IsNullOrEmpty(comPath)) return string.IsNullOrEmpty(uiaPath) ? null : uiaPath;
+        if (string.IsNullOrEmpty(uiaPath)) return comPath;
+
+        string c, u;
+        try
+        {
+            c = Path.GetFullPath(comPath.Trim().TrimEnd('\\', '/'));
+            u = Path.GetFullPath(uiaPath.Trim().TrimEnd('\\', '/'));
+        }
+        catch
+        {
+            return uiaPath;
+        }
+
+        if (string.Equals(c, u, StringComparison.OrdinalIgnoreCase))
+            return comPath;
+
+        if (u.StartsWith(c + "\\", StringComparison.OrdinalIgnoreCase))
+            return uiaPath;
+        if (c.StartsWith(u + "\\", StringComparison.OrdinalIgnoreCase))
+            return comPath;
+
+        if (ExplorerPathIsDriveLetterRootOnly(c) && !ExplorerPathIsDriveLetterRootOnly(u))
+            return uiaPath;
+        if (ExplorerPathIsDriveLetterRootOnly(u) && !ExplorerPathIsDriveLetterRootOnly(c))
+            return comPath;
+
+        return uiaPath;
+    }
+
+    private static bool ExplorerPathIsDriveLetterRootOnly(string normalizedFullPath)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(normalizedFullPath);
+            if (string.IsNullOrEmpty(root)) return false;
+            return string.Equals(
+                normalizedFullPath.TrimEnd('\\', '/'),
+                root.TrimEnd('\\', '/'),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static object? TryInvokeShellWindows(object shell)
@@ -577,21 +666,21 @@ internal static class FileManagerPathCollector
         }
     }
 
-    private static bool ExplorerFrameLikelyMatches(IntPtr explorerFrameHwnd, IntPtr shellReportedHwnd)
+    /// <returns>越高越可信；&lt;0 表示不应视为同一资源管理器窗口。</returns>
+    private static int ExplorerComMatchScore(IntPtr explorerFrameHwnd, IntPtr shellReportedHwnd)
     {
-        if (explorerFrameHwnd == IntPtr.Zero || shellReportedHwnd == IntPtr.Zero) return false;
-        if (explorerFrameHwnd == shellReportedHwnd) return true;
-        if (Win32.IsChild(explorerFrameHwnd, shellReportedHwnd)) return true;
-        if (Win32.GetAncestor(shellReportedHwnd, Win32.GA_ROOT) == explorerFrameHwnd) return true;
+        if (explorerFrameHwnd == IntPtr.Zero || shellReportedHwnd == IntPtr.Zero) return -1;
+        if (explorerFrameHwnd == shellReportedHwnd) return 4;
+        if (Win32.IsChild(explorerFrameHwnd, shellReportedHwnd)) return 3;
         for (var w = shellReportedHwnd; w != IntPtr.Zero; w = Win32.GetParent(w))
         {
-            if (w == explorerFrameHwnd) return true;
+            if (w == explorerFrameHwnd) return 2;
         }
+        if (Win32.GetAncestor(shellReportedHwnd, Win32.GA_ROOT) == explorerFrameHwnd) return 1;
         var frameRoot = Win32.GetAncestor(explorerFrameHwnd, Win32.GA_ROOT);
         var shellRoot = Win32.GetAncestor(shellReportedHwnd, Win32.GA_ROOT);
-        if (frameRoot != IntPtr.Zero && frameRoot == shellRoot)
-            return true;
-        return false;
+        if (frameRoot != IntPtr.Zero && frameRoot == shellRoot) return 0;
+        return -1;
     }
 
     private static string? ReadShellWindowPath(object win)
@@ -704,5 +793,82 @@ internal static class FileManagerPathCollector
         {
             Win32.CloseHandle(hProc);
         }
+    }
+
+    private sealed class ExplorerCabinetEnumState
+    {
+        public IntPtr Fg;
+        public uint Pid;
+        public IntPtr Found;
+    }
+
+    private static bool EnumExplorerCabinetCallback(IntPtr hWnd, IntPtr lParam)
+    {
+        var st = (ExplorerCabinetEnumState)GCHandle.FromIntPtr(lParam).Target!;
+        if (hWnd == IntPtr.Zero || !Win32.IsWindowVisible(hWnd)) return true;
+        var cls = Win32.GetWindowClassName(hWnd);
+        if (!cls.Equals("CabinetWClass", StringComparison.Ordinal)
+            && !cls.Equals("ExploreWClass", StringComparison.Ordinal))
+            return true;
+        Win32.GetWindowThreadProcessId(hWnd, out var p);
+        if (p != st.Pid) return true;
+        if (hWnd == st.Fg || Win32.IsChild(hWnd, st.Fg))
+        {
+            st.Found = hWnd;
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 父链断裂时：枚举同进程顶层 Cabinet，找到包含前台句柄的框架。
+    /// </summary>
+    private static IntPtr TryFindExplorerCabinetByEnumContains(IntPtr fg)
+    {
+        Win32.GetWindowThreadProcessId(fg, out var pid);
+        var st = new ExplorerCabinetEnumState { Fg = fg, Pid = pid, Found = IntPtr.Zero };
+        var gh = GCHandle.Alloc(st);
+        try
+        {
+            Win32.EnumWindows(EnumExplorerCabinetCallback, GCHandle.ToIntPtr(gh));
+            return st.Found;
+        }
+        finally
+        {
+            gh.Free();
+        }
+    }
+
+    /// <summary>
+    /// 自任意句柄沿 <see cref="Win32.GetParent"/> 向上查找资源管理器框架。
+    /// Win11 新版布局/XAML 岛等场景下父链或 GA_ROOT 可能无法直接命中，再用 <see cref="TryFindExplorerCabinetByEnumContains"/>。
+    /// </summary>
+    public static IntPtr TryFindExplorerCabinetFrame(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero || !Win32.IsWindow(hwnd)) return IntPtr.Zero;
+        const int maxHops = 64;
+        var w = hwnd;
+        for (var i = 0; i < maxHops && w != IntPtr.Zero; i++)
+        {
+            var cls = Win32.GetWindowClassName(w);
+            if (cls.Equals("CabinetWClass", StringComparison.Ordinal)
+                || cls.Equals("ExploreWClass", StringComparison.Ordinal))
+                return w;
+            w = Win32.GetParent(w);
+        }
+
+        return TryFindExplorerCabinetByEnumContains(hwnd);
+    }
+
+    /// <summary>
+    /// 若 <paramref name="foregroundHwnd"/> 所属（父链上）为资源管理器框架，返回当前文件夹路径。
+    /// </summary>
+    public static string? TryGetExplorerFolderIfForeground(IntPtr foregroundHwnd)
+    {
+        if (foregroundHwnd == IntPtr.Zero || !Win32.IsWindow(foregroundHwnd)) return null;
+        var frame = TryFindExplorerCabinetFrame(foregroundHwnd);
+        if (frame == IntPtr.Zero) return null;
+        return TryGetExplorerPathForHwnd(frame);
     }
 }

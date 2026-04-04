@@ -41,6 +41,7 @@ internal static class AppPaths
     public static string SqliteDbFile => Path.Combine(DataRoot, "clipboard_history.db");
     public static string ShellNavigateLogFile => Path.Combine(DataRoot, "shell_navigate.log");
     public static string ClipboardDiagnosticsLogFile => Path.Combine(DataRoot, "clipboard_diagnostics.log");
+    public static string ExplorerQuickFindLogFile => Path.Combine(DataRoot, "explorer_quickfind.log");
 
     /// <summary>
     /// 旧版 settings.json 所在目录（%AppData%\ClipboardX），迁移用。

@@ -18,6 +18,9 @@ public partial class App : Application
     private static Mutex? _mutex;
     private WinForms.NotifyIcon? _trayIcon;
     private PopupWindow? _popup;
+#if CLIPX_FILEJUMP
+    private ExplorerQuickFindController? _explorerQuickFind;
+#endif
     private AppSettings _settings = new();
     private static bool _probingAssemblyResolveRegistered;
 
@@ -123,6 +126,10 @@ public partial class App : Application
         _popup = new PopupWindow();
         _popup.Initialize(_settings);
         _popup.SettingsRequested += OpenSettings;
+
+#if CLIPX_FILEJUMP
+        SyncExplorerQuickFindHook();
+#endif
 
         SetupTrayIcon();
         _ = CheckForUpdatesOnStartupAsync();
@@ -386,11 +393,32 @@ public partial class App : Application
             _settings.FileJumpAutoOnFirstClick = copy.FileJumpAutoOnFirstClick;
             _settings.PreviewMaxLines = copy.PreviewMaxLines;
             _settings.PanelModifierKey = copy.PanelModifierKey;
+#if CLIPX_FILEJUMP
+            _settings.ExplorerEverythingQuickFindEnabled = copy.ExplorerEverythingQuickFindEnabled;
+            _settings.ExplorerEverythingQuickFindMaxResults = copy.ExplorerEverythingQuickFindMaxResults;
+            SyncExplorerQuickFindHook();
+#endif
             StartupRegistration.Apply(_settings.RunAtStartup);
             _settings.Save();
             UpdateTrayTooltip();
         }
     }
+
+#if CLIPX_FILEJUMP
+    /// <summary>按设置安装或卸载资源管理器内 Everything 筛选钩子。</summary>
+    private void SyncExplorerQuickFindHook()
+    {
+        if (!_settings.ExplorerEverythingQuickFindEnabled)
+        {
+            _explorerQuickFind?.Dispose();
+            _explorerQuickFind = null;
+            return;
+        }
+
+        _explorerQuickFind ??= new ExplorerQuickFindController(Dispatcher, _settings);
+        _explorerQuickFind.Start();
+    }
+#endif
 
 #if DEBUG
     private async void StartWindowInspection()
@@ -651,6 +679,10 @@ public partial class App : Application
     protected override void OnExit(ExitEventArgs e)
     {
         _popup?.Cleanup();
+#if CLIPX_FILEJUMP
+        _explorerQuickFind?.Dispose();
+        _explorerQuickFind = null;
+#endif
         if (_trayIcon != null)
         {
             _trayIcon.Visible = false;

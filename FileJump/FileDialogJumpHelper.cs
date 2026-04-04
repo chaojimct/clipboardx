@@ -248,7 +248,9 @@ internal static class FileDialogJumpHelper
                 }
                 catch { }
 
-                if (!allowBreadcrumbInLoop || best.Length > 0) continue;
+                // 勿在 best 非空时跳过：Win11 资源管理器等场景下 BFS 可能先命中「D:\」类 Value，
+                // 地址栏面包屑 Name（此电脑 > … > gn）在后序结点，仍需参与取更长、更具体的路径。
+                if (!allowBreadcrumbInLoop) continue;
 
                 try
                 {
@@ -487,6 +489,11 @@ internal static class FileDialogJumpHelper
     }
 
     /// <summary>供路径采集等模块复用：从 UI 文本还原为已存在的目录路径。</summary>
+    /// <remarks>
+    /// <para>禁止无名相对路径（如单独的 <c>tools</c>）走 <see cref="Directory.Exists"/>，否则会相对
+    /// <see cref="Environment.CurrentDirectory"/> 解析；<c>dotnet run</c> 时 cwd 常为仓库根，易误判为 <c>…\\clipboardx\\tools</c>。</para>
+    /// <para>但 <c>D:</c> 在 .NET 里不是 <see cref="Path.IsPathFullyQualified"/>，而地址栏常见，故对单盘符先规范为 <c>X:\\</c>。</para>
+    /// </remarks>
     internal static bool TryNormalizeToExistingDirectory(string? raw, out string norm)
     {
         norm = "";
@@ -496,20 +503,31 @@ internal static class FileDialogJumpHelper
 
         try
         {
+            // 单独「D:」等：与 IsPathFullyQualified 兼容的资源管理器地址栏形态
+            if (v.Length == 2 && v[1] == ':' && char.IsLetter(v[0]))
+            {
+                var root = char.ToUpperInvariant(v[0]) + @":\";
+                if (Directory.Exists(root))
+                {
+                    norm = Path.GetFullPath(root);
+                    return true;
+                }
+            }
+
+            if (!Path.IsPathFullyQualified(v))
+                return false;
+
             if (Directory.Exists(v))
             {
                 norm = Path.GetFullPath(v);
                 return true;
             }
 
-            if (Path.IsPathRooted(v) || v.Contains('\\') || v.Contains('/'))
+            var dir = Path.GetDirectoryName(v);
+            if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
             {
-                var dir = Path.GetDirectoryName(v);
-                if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
-                {
-                    norm = Path.GetFullPath(dir);
-                    return true;
-                }
+                norm = Path.GetFullPath(dir);
+                return true;
             }
         }
         catch { }

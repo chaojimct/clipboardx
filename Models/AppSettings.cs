@@ -76,6 +76,15 @@ public class AppSettings
     /// <summary>最近一次在「打开/保存」对话框中记录到的文件夹，供 Ctrl+G 跳转。</summary>
     public string LastFileDialogFolder { get; set; } = "";
 
+    /// <summary>资源管理器非地址栏焦点时直接键入：用 Everything 限定当前文件夹检索并弹出结果（需本机运行 Everything）。默认关闭，见设置「实验性功能」。</summary>
+    public bool ExplorerEverythingQuickFindEnabled { get; set; } = false;
+
+    /// <summary>Everything IPC 单次最大返回条数。</summary>
+    public int ExplorerEverythingQuickFindMaxResults { get; set; } = 150;
+
+    /// <summary>已保留字段：配置仍可反序列化；当前版本始终走 Everything，保存设置时会写回 false。</summary>
+    public bool UseFindXSearch { get; set; } = false;
+
     public string HotkeyDisplayName => FormatHotkey(HotkeyModifiers, HotkeyKey);
 
     public string FileJumpHotkeyDisplayName => FormatHotkey(FileJumpHotkeyModifiers, FileJumpHotkeyKey);
@@ -145,6 +154,8 @@ public class AppSettings
                         settings.FileJumpAutoSyncOnReturn = true;
                     if (!doc.RootElement.TryGetProperty(nameof(CheckUpdatesOnStartup), out _))
                         settings.CheckUpdatesOnStartup = true;
+                    if (!doc.RootElement.TryGetProperty(nameof(ExplorerEverythingQuickFindMaxResults), out _))
+                        settings.ExplorerEverythingQuickFindMaxResults = 150;
                     if (settings.FolderFavorites == null)
                         settings.FolderFavorites = new List<FolderFavoriteEntry>();
                     return settings;
@@ -180,6 +191,8 @@ public class AppSettings
                         settings.FileJumpAutoSyncOnReturn = true;
                     if (!doc.RootElement.TryGetProperty(nameof(CheckUpdatesOnStartup), out _))
                         settings.CheckUpdatesOnStartup = true;
+                    if (!doc.RootElement.TryGetProperty(nameof(ExplorerEverythingQuickFindMaxResults), out _))
+                        settings.ExplorerEverythingQuickFindMaxResults = 150;
                     if (settings.FolderFavorites == null)
                         settings.FolderFavorites = new List<FolderFavoriteEntry>();
                     settings.Save();
@@ -227,6 +240,9 @@ public class AppSettings
         PanelModifierKey = PanelModifierKey,
         QuickPastes = QuickPastes.Select(q => new QuickPasteEntry { Phrase = q.Phrase, Content = q.Content }).ToList(),
         FolderFavorites = FolderFavorites.Select(f => new FolderFavoriteEntry { Phrase = f.Phrase, Path = f.Path }).ToList(),
-        LastFileDialogFolder = LastFileDialogFolder
+        LastFileDialogFolder = LastFileDialogFolder,
+        ExplorerEverythingQuickFindEnabled = ExplorerEverythingQuickFindEnabled,
+        ExplorerEverythingQuickFindMaxResults = ExplorerEverythingQuickFindMaxResults,
+        UseFindXSearch = UseFindXSearch
     };
 }

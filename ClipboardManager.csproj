@@ -58,6 +58,8 @@
   <ItemGroup Condition="'$(ClipboardXProduct)' != 'ClipboardOnly'">
     <None Include="native\ShellNavigate\bin\x64\Release\ClipboardXShellNavigate.dll" Link="ClipboardXShellNavigate.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('native\ShellNavigate\bin\x64\Release\ClipboardXShellNavigate.dll')" />
     <None Include="native\ShellNavigate\bin\Win32\Release\ClipboardXShellNavigate32.dll" Link="ClipboardXShellNavigate32.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('native\ShellNavigate\bin\Win32\Release\ClipboardXShellNavigate32.dll')" />
+    <!-- voidtools SDK：与程序集同目录加载；见 native\ 下说明 -->
+    <None Include="native\Everything64.dll" Link="Everything64.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('native\Everything64.dll')" />
   </ItemGroup>
 
 </Project>

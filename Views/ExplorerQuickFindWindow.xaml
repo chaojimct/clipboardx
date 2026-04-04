@@ -1,0 +1,85 @@
+<Window x:Class="ClipboardManager.ExplorerQuickFindWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="ClipboardX — 文件夹内筛选"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        Topmost="True"
+        ResizeMode="NoResize"
+        WindowStartupLocation="Manual"
+        Width="540"
+        MinWidth="400"
+        SizeToContent="Height"
+        MaxHeight="520"
+        Focusable="False"
+        ShowActivated="False">
+    <Window.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="SharedPopupStyles.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </Window.Resources>
+
+    <Grid>
+        <Border x:Name="MainBorder" Background="{DynamicResource PopupBgBrush}" CornerRadius="12" Margin="16">
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="20" ShadowDepth="4" Opacity="0.5" Color="Black"/>
+            </Border.Effect>
+
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*" MinHeight="60"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- 标题栏 -->
+                <Grid Grid.Row="0" Margin="16,12,16,8">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="Everything" FontSize="14" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource PrimaryText}" VerticalAlignment="Center"
+                                   Opacity="0.7"/>
+                    </StackPanel>
+                    <TextBlock x:Name="CountLabel" HorizontalAlignment="Right" VerticalAlignment="Center"
+                               FontSize="12" Foreground="{DynamicResource SecondaryText}"/>
+                </Grid>
+
+                <Border Grid.Row="1" Height="1" Background="{DynamicResource ThemeSeparator}"/>
+
+                <!-- 搜索信息栏 -->
+                <Border Grid.Row="2" Margin="12,8,12,4" Padding="10,7"
+                        Background="{DynamicResource SurfaceBrush}" CornerRadius="8">
+                    <StackPanel>
+                        <TextBlock x:Name="FolderLabel" FontSize="11" Foreground="{DynamicResource SecondaryText}"
+                                   TextTrimming="CharacterEllipsis" MaxWidth="480"/>
+                        <TextBlock x:Name="TypingLabel" FontSize="14" FontWeight="SemiBold"
+                                   Foreground="{DynamicResource PrimaryText}" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- 结果列表 -->
+                <ListBox x:Name="ResultsList" Grid.Row="3" Margin="4,2,4,0"
+                         Background="Transparent"
+                         BorderThickness="0"
+                         FocusVisualStyle="{x:Null}"
+                         Padding="4"
+                         MaxHeight="340"
+                         PreviewMouseLeftButtonUp="ResultsList_OnPreviewMouseLeftButtonUp"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+
+                <!-- 底栏提示 -->
+                <Border Grid.Row="4" Padding="14,7" Background="{DynamicResource FooterBrush}"
+                        CornerRadius="0,0,12,12">
+                    <TextBlock x:Name="HintLabel" Foreground="{DynamicResource MutedText}" FontSize="10"
+                               HorizontalAlignment="Center" TextWrapping="Wrap" TextAlignment="Center"
+                               Text="↑↓ 选择 · Enter 定位 · Esc 关闭"/>
+                </Border>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
