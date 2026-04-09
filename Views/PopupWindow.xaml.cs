@@ -26,6 +26,7 @@ public partial class PopupWindow : Window
 {
     private const int HotkeyId = 9001;
     private const int HotkeyJumpLastFolderId = 9002;
+    private const int AltMenuProtectionWindowMs = 350;
 
     private readonly List<ClipboardEntry> _allItems = new();
     private readonly ObservableCollection<ClipboardEntry> _displayItems = new();
@@ -522,6 +523,8 @@ public partial class PopupWindow : Window
                 {
 #if CLIPX_CLIPBOARD
                     case HotkeyId:
+                        if ((_hotkeyModifiers & Win32.MOD_ALT) != 0)
+                            PrimeAltHotkeyProtection();
                         TogglePopup();
                         handled = true;
                         break;
@@ -873,11 +876,18 @@ public partial class PopupWindow : Window
         if (_appSettings == null) return;
         var prev = GetBatchMode();
         _appSettings.BatchPasteMode = mode.ToString();
+        
+        // 切到普通模式时：彻底清空队列、清理显示、重置状态
         if (mode == BatchPasteQueueMode.Off)
+        {
             _batchQueue.Clear();
+            UpdateBatchOrderProperties();
+        }
+        
         _appSettings.Save();
         UpdateBatchHeaderUi();
-        UpdateBatchOrderProperties();
+        if (mode != BatchPasteQueueMode.Off)
+            UpdateBatchOrderProperties();
         RefreshFilter();
 #if CLIPX_CLIPBOARD
         SyncBatchPasteKeyboardHook();
@@ -1198,13 +1208,17 @@ public partial class PopupWindow : Window
 #if CLIPX_CLIPBOARD
         if (entry.IsQuickPaste) return;
         var mode = GetBatchMode();
-        if (mode == BatchPasteQueueMode.Off) return;
+        
+        // 普通模式（Off）下不进行任何队列操作
+        if (mode == BatchPasteQueueMode.Off) 
+            return;
 
         _batchQueue.Remove(entry);
         if (mode == BatchPasteQueueMode.Fifo)
             _batchQueue.Add(entry);
-        else
+        else // LIFO
             _batchQueue.Insert(0, entry);
+        
         UpdateBatchOrderProperties();
         ReorderAllItemsQueueFirst();
         SyncBatchPasteKeyboardHook();
@@ -1618,6 +1632,7 @@ public partial class PopupWindow : Window
     {
         CleanupOldClipboardExports();
         _targetWindow = Win32.GetForegroundWindow();
+        CancelMenuModeForWindow(_targetWindow);
         _searchText = "";
         _typeFilter = null;
         _quickPhraseOnly = false;
@@ -1688,6 +1703,7 @@ public partial class PopupWindow : Window
         _isPopupVisible = false;
         _lockPopupWindowNomove = false;
         _lastPopupToggleTick = Environment.TickCount64;
+        CancelMenuModeForWindow(_targetWindow != IntPtr.Zero ? _targetWindow : Win32.GetForegroundWindow());
         UninstallMouseHook();
         CloseEntryPreviewBubble();
         CloseContextMenuPopup();
@@ -2976,6 +2992,35 @@ public partial class PopupWindow : Window
     private static bool IsMenuAltVk(uint vk) =>
         vk == 0x12 || vk == 0xA4 || vk == 0xA5;
 
+    private static IntPtr ResolveRootWindow(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero || !Win32.IsWindow(hwnd)) return IntPtr.Zero;
+        var root = Win32.GetAncestor(hwnd, Win32.GA_ROOT);
+        return root != IntPtr.Zero && Win32.IsWindow(root) ? root : hwnd;
+    }
+
+    private void CancelMenuModeForWindow(IntPtr hwnd)
+    {
+        var root = ResolveRootWindow(hwnd);
+        if (root == IntPtr.Zero) return;
+        Win32.PostMessage(root, Win32.WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    private void PrimeAltHotkeyProtection()
+    {
+        _lastPopupToggleTick = Environment.TickCount64;
+        InstallKeyboardHook();
+        CancelMenuModeForWindow(Win32.GetForegroundWindow());
+    }
+
+    private IntPtr PassKeyThroughThenCancelHostMenu(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        var result = Win32.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+        var host = _targetWindow != IntPtr.Zero ? _targetWindow : Win32.GetForegroundWindow();
+        Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() => CancelMenuModeForWindow(host)));
+        return result;
+    }
+
     private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         if (nCode < 0)
@@ -2986,12 +3031,18 @@ public partial class PopupWindow : Window
         var isKeyDown = msg is Win32.WM_KEYDOWN or Win32.WM_SYSKEYDOWN;
         var isKeyUp = msg is Win32.WM_KEYUP or Win32.WM_SYSKEYUP;
 
-        // 防止 Alt+快捷键 释放后的单独 Alt 激活前台窗口菜单：打开/关闭弹窗后 200ms 内仍拦截 Alt 按键
-        if (isKeyUp && IsMenuAltVk(kb.vkCode))
+        // Keep Alt-triggered popup toggles from leaking a menu gesture back to the host window.
+        // Swallow Alt down, but let Alt up pass through after cancelling menu mode so Alt won't look stuck.
+        if ((isKeyDown || isKeyUp) && IsMenuAltVk(kb.vkCode))
         {
             var timeSinceToggle = Environment.TickCount64 - _lastPopupToggleTick;
-            if (timeSinceToggle >= 0 && timeSinceToggle < 200)
-                return (IntPtr)1;
+            if (timeSinceToggle >= 0 && timeSinceToggle < AltMenuProtectionWindowMs)
+            {
+                CancelMenuModeForWindow(_targetWindow != IntPtr.Zero ? _targetWindow : Win32.GetForegroundWindow());
+                if (isKeyDown)
+                    return (IntPtr)1;
+                return PassKeyThroughThenCancelHostMenu(nCode, wParam, lParam);
+            }
         }
 
 #if CLIPX_CLIPBOARD
@@ -3042,7 +3093,7 @@ public partial class PopupWindow : Window
         if (isKeyUp && IsMenuAltVk(kb.vkCode))
         {
             if (PhraseEditPopup.IsOpen)
-                return Win32.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+                return PassKeyThroughThenCancelHostMenu(nCode, wParam, lParam);
 
             if (BatchMenuPopup.IsOpen)
             {
@@ -3051,7 +3102,8 @@ public partial class PopupWindow : Window
                 _ctxAltCloseMenuArmed = false;
                 _ctxAltAwaitRelease = false;
                 _ctxAltComboDuringRelease = false;
-                return Win32.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+                CancelMenuModeForWindow(_targetWindow != IntPtr.Zero ? _targetWindow : Win32.GetForegroundWindow());
+                return PassKeyThroughThenCancelHostMenu(nCode, wParam, lParam);
             }
 
             if (ContextPopup.IsOpen)
@@ -3061,14 +3113,16 @@ public partial class PopupWindow : Window
                 _ctxAltCloseMenuArmed = false;
                 _ctxAltAwaitRelease = false;
                 _ctxAltComboDuringRelease = false;
-                return Win32.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+                CancelMenuModeForWindow(_targetWindow != IntPtr.Zero ? _targetWindow : Win32.GetForegroundWindow());
+                return PassKeyThroughThenCancelHostMenu(nCode, wParam, lParam);
             }
 
             if (_ctxAltAwaitRelease && !_ctxAltComboDuringRelease)
                 Dispatcher.BeginInvoke(TryOpenBatchOrContextMenuFromKeyboard);
             _ctxAltAwaitRelease = false;
             _ctxAltComboDuringRelease = false;
-            return Win32.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+            CancelMenuModeForWindow(_targetWindow != IntPtr.Zero ? _targetWindow : Win32.GetForegroundWindow());
+            return PassKeyThroughThenCancelHostMenu(nCode, wParam, lParam);
         }
 
         if (!isKeyDown)
@@ -3152,7 +3206,7 @@ public partial class PopupWindow : Window
             {
                 _ctxAltCloseMenuArmed = true;
                 _ctxAltComboDuringRelease = false;
-                return Win32.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+                return (IntPtr)1;
             }
 
             bool altPhyB = ((Win32.GetAsyncKeyState(0x12) & 0x8000) != 0)
@@ -3186,7 +3240,7 @@ public partial class PopupWindow : Window
             {
                 _ctxAltCloseMenuArmed = true;
                 _ctxAltComboDuringRelease = false;
-                return Win32.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+                return (IntPtr)1;
             }
 
             bool altPhy = ((Win32.GetAsyncKeyState(0x12) & 0x8000) != 0)
@@ -3218,7 +3272,7 @@ public partial class PopupWindow : Window
         {
             _ctxAltAwaitRelease = true;
             _ctxAltComboDuringRelease = false;
-            return Win32.CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+            return (IntPtr)1;
         }
 
         if (_ctxAltAwaitRelease && !IsMenuAltVk(kb.vkCode))
