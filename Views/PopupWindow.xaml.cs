@@ -53,8 +53,8 @@ public partial class PopupWindow : Window
     private IntPtr _mouseHook;
     private IntPtr _winEventHook;
     private IntPtr _winEventHookFocus;
-    /// <summary>最后一次弹窗关闭时刻（毫秒，TickCount64），用于拦截 Alt 快捷键释放后的单独 Alt 按键。</summary>
-    private long _lastPopupHideTick;
+    /// <summary>最后一次弹窗打开或关闭时刻（毫秒，TickCount64），用于拦截 Alt 快捷键释放后的单独 Alt 按键（打开/关闭后200ms内）。</summary>
+    private long _lastPopupToggleTick;
 
     /// <summary>
     /// WH_KEYBOARD_LL / WH_MOUSE_LL 回调由 user32 保存函数指针；Unhook 后仍可能再触发一两次。
@@ -1658,6 +1658,8 @@ public partial class PopupWindow : Window
         if (_displayItems.Count > 0)
             ItemsList.SelectedIndex = 0;
 
+        _lastPopupToggleTick = Environment.TickCount64;
+
 #if CLIPX_CLIPBOARD
         SyncBatchPasteKeyboardHook();
 #else
@@ -1685,7 +1687,7 @@ public partial class PopupWindow : Window
     {
         _isPopupVisible = false;
         _lockPopupWindowNomove = false;
-        _lastPopupHideTick = Environment.TickCount64;
+        _lastPopupToggleTick = Environment.TickCount64;
         UninstallMouseHook();
         CloseEntryPreviewBubble();
         CloseContextMenuPopup();
@@ -2984,11 +2986,11 @@ public partial class PopupWindow : Window
         var isKeyDown = msg is Win32.WM_KEYDOWN or Win32.WM_SYSKEYDOWN;
         var isKeyUp = msg is Win32.WM_KEYUP or Win32.WM_SYSKEYUP;
 
-        // 防止 Alt+快捷键 释放后的单独 Alt 激活前台窗口菜单：关闭弹窗后 200ms 内仍拦截 Alt 按键
-        if (!_isPopupVisible && isKeyUp && IsMenuAltVk(kb.vkCode))
+        // 防止 Alt+快捷键 释放后的单独 Alt 激活前台窗口菜单：打开/关闭弹窗后 200ms 内仍拦截 Alt 按键
+        if (isKeyUp && IsMenuAltVk(kb.vkCode))
         {
-            var timeSinceHide = Environment.TickCount64 - _lastPopupHideTick;
-            if (timeSinceHide >= 0 && timeSinceHide < 200)
+            var timeSinceToggle = Environment.TickCount64 - _lastPopupToggleTick;
+            if (timeSinceToggle >= 0 && timeSinceToggle < 200)
                 return (IntPtr)1;
         }
 
