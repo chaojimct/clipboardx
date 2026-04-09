@@ -53,6 +53,8 @@ public partial class PopupWindow : Window
     private IntPtr _mouseHook;
     private IntPtr _winEventHook;
     private IntPtr _winEventHookFocus;
+    /// <summary>最后一次弹窗关闭时刻（毫秒，TickCount64），用于拦截 Alt 快捷键释放后的单独 Alt 按键。</summary>
+    private long _lastPopupHideTick;
 
     /// <summary>
     /// WH_KEYBOARD_LL / WH_MOUSE_LL 回调由 user32 保存函数指针；Unhook 后仍可能再触发一两次。
@@ -1683,6 +1685,7 @@ public partial class PopupWindow : Window
     {
         _isPopupVisible = false;
         _lockPopupWindowNomove = false;
+        _lastPopupHideTick = Environment.TickCount64;
         UninstallMouseHook();
         CloseEntryPreviewBubble();
         CloseContextMenuPopup();
@@ -2980,6 +2983,14 @@ public partial class PopupWindow : Window
         var kb = Marshal.PtrToStructure<Win32.KBDLLHOOKSTRUCT>(lParam);
         var isKeyDown = msg is Win32.WM_KEYDOWN or Win32.WM_SYSKEYDOWN;
         var isKeyUp = msg is Win32.WM_KEYUP or Win32.WM_SYSKEYUP;
+
+        // 防止 Alt+快捷键 释放后的单独 Alt 激活前台窗口菜单：关闭弹窗后 200ms 内仍拦截 Alt 按键
+        if (!_isPopupVisible && isKeyUp && IsMenuAltVk(kb.vkCode))
+        {
+            var timeSinceHide = Environment.TickCount64 - _lastPopupHideTick;
+            if (timeSinceHide >= 0 && timeSinceHide < 200)
+                return (IntPtr)1;
+        }
 
 #if CLIPX_CLIPBOARD
         // 非本窗口内 Ctrl+V 松 V、或 Shift+Insert 松 Insert：FIFO/LIFO 出队并写下一项到剪贴板；不拦截按键
