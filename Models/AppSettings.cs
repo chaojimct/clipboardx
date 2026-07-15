@@ -12,6 +12,12 @@ public class QuickPasteEntry
 public class AppSettings
 {
     public int MaxItems { get; set; } = 2000;
+
+    /// <summary>图片条目专项上限。图片占用远大于文本/文件，独立限制避免内存失控。默认 150 张。</summary>
+    public int MaxImageItems { get; set; } = 150;
+
+    /// <summary>单张图片最大字节数（PNG 编码后）。超过则跳过不入库，避免单张超大图片吃掉大量内存。默认 15MB。</summary>
+    public long MaxImageSizeBytes { get; set; } = 15 * 1024 * 1024;
     public uint HotkeyModifiers { get; set; } = Win32.MOD_CONTROL;
     public uint HotkeyKey { get; set; } = Win32.VK_OEM_3;
 
@@ -672,6 +678,8 @@ public class AppSettings
     public AppSettings ShallowCopy() => new()
     {
         MaxItems = MaxItems,
+        MaxImageItems = MaxImageItems,
+        MaxImageSizeBytes = MaxImageSizeBytes,
         HotkeyModifiers = HotkeyModifiers,
         HotkeyKey = HotkeyKey,
         FileJumpHotkeyModifiers = FileJumpHotkeyModifiers,

@@ -270,6 +270,18 @@
                                  Background="{DynamicResource SurfaceBrush}" Foreground="{DynamicResource PrimaryText}"
                                  BorderBrush="{DynamicResource ThemeBorder}" CaretBrush="{DynamicResource PrimaryText}" />
 
+                        <TextBlock Grid.Row="3" Grid.Column="0" Text="最大图片条数"
+                                   Foreground="{DynamicResource PrimaryText}" FontSize="14" VerticalAlignment="Center"
+                                   ToolTip="图片占用远大于文本，独立限制避免内存失控。默认 150 张，超出自动清理最旧的图片。"
+                                   Margin="0,8,0,0" />
+                        <TextBox x:Name="MaxImageItemsBox" Grid.Row="3" Grid.Column="1"
+                                 HorizontalAlignment="Right" Width="140"
+                                 FontSize="14" Padding="8,6"
+                                 Background="{DynamicResource SurfaceBrush}" Foreground="{DynamicResource PrimaryText}"
+                                 BorderBrush="{DynamicResource ThemeBorder}" CaretBrush="{DynamicResource PrimaryText}"
+                                 ToolTip="图片占用远大于文本，独立限制避免内存失控（10～2000）"
+                                 Margin="0,8,0,0" />
+
                         <TextBlock Grid.Row="4" Grid.Column="0" Text="呼出快捷键"
                                    Foreground="{DynamicResource PrimaryText}" FontSize="14" VerticalAlignment="Center" />
                         <Border x:Name="HotkeyBox" Grid.Row="4" Grid.Column="1"

@@ -127,7 +127,15 @@
                          ScrollViewer.ScrollChanged="ItemsList_ScrollChanged"
                          PreviewMouseLeftButtonUp="ItemsList_PreviewMouseUp"
                          PreviewMouseRightButtonUp="ItemsList_PreviewMouseRightUp"
-                         PreviewMouseDown="ItemsList_PreviewMouseDown">
+                         PreviewMouseDown="ItemsList_PreviewMouseDown"
+                         VirtualizingStackPanel.IsVirtualizing="True"
+                         VirtualizingStackPanel.VirtualizationMode="Recycling">
+                    <ListBox.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <VirtualizingStackPanel IsVirtualizing="True"
+                                                    VirtualizationMode="Recycling"/>
+                        </ItemsPanelTemplate>
+                    </ListBox.ItemsPanel>
                     <ListBox.ItemTemplate>
                         <DataTemplate>
                             <Grid Margin="0,0" UseLayoutRounding="True">

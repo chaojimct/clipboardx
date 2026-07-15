@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 
+## [1.9.5] - 2026-07-15
+
+### 剪贴板 · 内存优化
+
+- **修复 OCR 后台队列击穿懒加载**：启动时 `ImageOcrQueue.EnqueueBackfill` 的过滤条件调用 `TryGetImageData()`，触发每张图片从 SQLite 懒加载完整 PNG 字节到内存。40 张候选图片 × 2-5MB ≈ 80-200MB 全部读入内存，与降内存目标相反。改为仅用 `PersistedId` 元数据筛选，真正的字节加载延迟到 Worker 处理该条时
+- **OCR 处理完即释放图片字节**：`ProcessOneAsync` 完成单条 OCR 后调用 `ReleaseImageData()`，处理 N 张图片时同时只持有 1 张的字节在内存（之前 N 张会累积不释放）
+- **修复缩略图懒加载回归**：`Thumbnail` getter 之前用 `ImageData != null` 判断，懒加载场景下永远为 false，导致图片条目列表不显示缩略图。改为按 `Type == EntryType.Image` 判断，并在 `CreateThumbnail` 生成 64px 缩略图后立即释放原始 PNG 字节
+- **`Enqueue` 早退检查不预加载**：改为「内存已有 OR 可懒加载」二选一判断，新捕获图片走内存路径，启动 backfill 走懒加载路径，两者都不预读字节
+
 ## [1.9.4] - 2026-07-07
 
 ### 剪贴板 · 粘贴稳定性

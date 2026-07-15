@@ -15,6 +15,7 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using ClipboardManager.Models;
 using Brush = System.Windows.Media.Brush;
 using Button = System.Windows.Controls.Button;
 using Orientation = System.Windows.Controls.Orientation;
@@ -29,7 +30,7 @@ public partial class PopupWindow : Window
     private const int HotkeyJumpLastFolderId = 9002;
 
     private readonly List<ClipboardEntry> _allItems = new();
-    private readonly ObservableCollection<ClipboardEntry> _displayItems = new();
+    private readonly BulkObservableCollection<ClipboardEntry> _displayItems = new();
 
     /// <summary>FIFO/LIFO 下：多选 Enter 入队、新复制可自动入队；出队后条目不占批量角标，回到底部列表排序。</summary>
     private readonly List<ClipboardEntry> _batchQueue = new();
@@ -398,6 +399,15 @@ public partial class PopupWindow : Window
 #if CLIPX_CLIPBOARD
         Win32.RemoveClipboardFormatListener(_hwnd);
 #endif
+        // 清理所有内存集合，释放图片 byte[] 和缩略图
+        _allItems.Clear();
+        _displayItems.Clear();
+        _batchQueue.Clear();
+        // 主动 GC：BitmapImage 的非托管像素缓冲区依赖 finalizer 延迟释放，
+        // 这里强制回收以立即降低内存占用
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
     }
 
 #if CLIPX_CLIPBOARD
@@ -532,9 +542,18 @@ public partial class PopupWindow : Window
         try
         {
             _historyStore.PruneExcess(_maxItems);
-            var batch = _historyStore.LoadNewestFirst(_maxItems);
+            _historyStore.PruneExcessImages(_appSettings.MaxImageItems);
+            // 轻量加载：不读取 image_blob，图片数据按需从数据库获取，大幅降低启动内存
+            var batch = _historyStore.LoadNewestFirstLite(_maxItems);
+            // 为每条图片条目设置懒加载委托
+            var storeRef = _historyStore;
             for (int i = batch.Count - 1; i >= 0; i--)
-                _allItems.Insert(0, batch[i]);
+            {
+                var entry = batch[i];
+                if (entry.Type == EntryType.Image)
+                    entry.ImageDataLoader = id => storeRef.LoadImageData(id);
+                _allItems.Insert(0, entry);
+            }
         }
         catch { /* ignore */ }
     }
@@ -1145,12 +1164,21 @@ public partial class PopupWindow : Window
                         {
                             ClipboardDiagnosticsLog.Write(
                                 $"monitor EncodeToPng OK {pw}x{ph} outBytes={pngData.Length} elapsedMs={sw.ElapsedMilliseconds}");
+                            // 单张图片大小限制：超过则跳过入库，避免单张超大图片吃掉大量内存
+                            if (pngData.Length > _appSettings.MaxImageSizeBytes)
+                            {
+                                ClipboardDiagnosticsLog.Write(
+                                    $"monitor image skipped: too large {pngData.Length} > {_appSettings.MaxImageSizeBytes}");
+                                return;
+                            }
                             DeduplicateImageByMd5(pngData);
                             var ie = new ClipboardEntry
                             {
                                 Type = EntryType.Image, ImageData = pngData,
                                 ImageWidth = pw, ImageHeight = ph
                             };
+                            // 设置懒加载委托，以便后续 ImageData 被释放后可按需重新加载
+                            ie.ImageDataLoader = id => _historyStore.LoadImageData(id);
                             _allItems.Insert(0, ie);
                             TrimItems();
                             _historyStore.TryInsert(ie);
@@ -1242,6 +1270,7 @@ public partial class PopupWindow : Window
 #if CLIPX_CLIPBOARD
         var queueTouched = false;
 #endif
+        // 1. 总条数上限
         while (regular.Count > _maxItems)
         {
             var last = regular[^1];
@@ -1255,6 +1284,29 @@ public partial class PopupWindow : Window
 #endif
             regular.RemoveAt(regular.Count - 1);
         }
+
+        // 2. 图片专项上限——图片占用远大于文本，独立裁剪
+        var maxImages = _appSettings.MaxImageItems;
+        if (maxImages > 0)
+        {
+            var images = regular.Where(x => x.Type == EntryType.Image).ToList();
+            if (images.Count > maxImages)
+            {
+                var toRemove = images.Skip(maxImages).ToList();
+                foreach (var entry in toRemove)
+                {
+                    _historyStore.TryDelete(entry.PersistedId);
+                    _allItems.Remove(entry);
+#if CLIPX_CLIPBOARD
+                    if (_batchQueue.Remove(entry))
+                        queueTouched = true;
+#else
+                    _batchQueue.Remove(entry);
+#endif
+                }
+            }
+        }
+
 #if CLIPX_CLIPBOARD
         if (queueTouched)
             RequestBatchQueueHeadClipboardResyncAfterDedup();
@@ -1273,7 +1325,6 @@ public partial class PopupWindow : Window
     {
         CloseEntryPreviewBubble();
         ClearPendingDelete();
-        _displayItems.Clear();
         _firstVisibleIndex = 0;
         var query = _searchText.Trim();
 
@@ -1289,26 +1340,51 @@ public partial class PopupWindow : Window
         if (!string.IsNullOrEmpty(query))
             items = items.Where(i => i.MatchesSearch(query));
 
-        var filtered = items.ToList();
-        var filteredSet = filtered.ToHashSet();
-        UpdateBatchOrderProperties();
-        var queuePart = _batchQueue.Where(e => filteredSet.Contains(e)).ToList();
-        var qset = new HashSet<ClipboardEntry>(_batchQueue);
-        var rest = filtered
-            .Where(e => !qset.Contains(e))
-            .OrderByDescending(i => i.IsQuickPaste && !string.IsNullOrEmpty(_searchText))
-            .ThenByDescending(i => i.CopiedAt);
+        // 批量更新：抑制逐条 CollectionChanged，结束时一次 Reset 通知
+        using (_displayItems.BeginBulkUpdate())
+        {
+            _displayItems.Clear();
 
-        int idx = 1;
-        foreach (var item in queuePart)
-        {
-            item.DisplayIndex = idx++;
-            _displayItems.Add(item);
-        }
-        foreach (var item in rest)
-        {
-            item.DisplayIndex = idx++;
-            _displayItems.Add(item);
+            var filtered = items.ToList();
+            // 用引用比较的 HashSet 避免对 ClipboardEntry 的大量 GetHashCode 调用
+            var filteredSet = new HashSet<ClipboardEntry>(filtered, System.Collections.Generic.ReferenceEqualityComparer.Instance);
+            UpdateBatchOrderProperties();
+            var qset = new HashSet<ClipboardEntry>(_batchQueue, System.Collections.Generic.ReferenceEqualityComparer.Instance);
+
+            var queuePart = new List<ClipboardEntry>(_batchQueue.Count);
+            foreach (var e in _batchQueue)
+                if (filteredSet.Contains(e))
+                    queuePart.Add(e);
+
+            var rest = new List<ClipboardEntry>(filtered.Count);
+            foreach (var e in filtered)
+                if (!qset.Contains(e))
+                    rest.Add(e);
+
+            // 稳定排序：快捷短语优先（有搜索词时），否则按时间倒序
+            var hasSearch = !string.IsNullOrEmpty(_searchText);
+            rest.Sort((a, b) =>
+            {
+                if (hasSearch)
+                {
+                    var aQuick = a.IsQuickPaste ? 1 : 0;
+                    var bQuick = b.IsQuickPaste ? 1 : 0;
+                    if (aQuick != bQuick) return bQuick.CompareTo(aQuick);
+                }
+                return b.CopiedAt.CompareTo(a.CopiedAt);
+            });
+
+            int idx = 1;
+            foreach (var item in queuePart)
+            {
+                item.DisplayIndex = idx++;
+                _displayItems.Add(item);
+            }
+            foreach (var item in rest)
+            {
+                item.DisplayIndex = idx++;
+                _displayItems.Add(item);
+            }
         }
 
         UpdateEmptyState();
@@ -1671,7 +1747,8 @@ public partial class PopupWindow : Window
                         case EntryType.Image:
                         {
                             BitmapImage? bi = null;
-                            using (var ms = new MemoryStream(item.ImageData!))
+                            var imgBytes = item.TryGetImageData();
+                            using (var ms = new MemoryStream(imgBytes!))
                             {
                                 bi = new BitmapImage();
                                 bi.BeginInit();
@@ -1684,7 +1761,7 @@ public partial class PopupWindow : Window
                             {
                                 ok = await TrySetClipboardImageWithNativeFallbackAsync(
                                     bi,
-                                    item.ImageData,
+                                    imgBytes,
                                     _hwnd,
                                     maxRetries: clipRetries,
                                     baseDelayMs: clipRetryDelayMs);
@@ -2208,18 +2285,22 @@ public partial class PopupWindow : Window
                 foreach (var p in e.FilePaths)
                     if (!string.IsNullOrWhiteSpace(p)) paths.Add(p);
             }
-            else if (e.Type == EntryType.Image && e.ImageData is { Length: > 0 })
+            else if (e.Type == EntryType.Image)
             {
-                try
+                var imgData = e.TryGetImageData();
+                if (imgData is { Length: > 0 })
                 {
-                    var p = Path.Combine(dir, $"clip_{DateTime.Now:yyyyMMdd_HHmmss_fff}_{Guid.NewGuid():N}.png");
-                    File.WriteAllBytes(p, e.ImageData);
-                    paths.Add(p);
-                    tempPathsToCleanupOnFailure.Add(p);
-                }
-                catch (Exception ex)
-                {
-                    ClipboardDiagnosticsLog.Write($"BATCH_FILEDROP image temp write failed: {ex.GetType().Name}: {ex.Message}");
+                    try
+                    {
+                        var p = Path.Combine(dir, $"clip_{DateTime.Now:yyyyMMdd_HHmmss_fff}_{Guid.NewGuid():N}.png");
+                        File.WriteAllBytes(p, imgData);
+                        paths.Add(p);
+                        tempPathsToCleanupOnFailure.Add(p);
+                    }
+                    catch (Exception ex)
+                    {
+                        ClipboardDiagnosticsLog.Write($"BATCH_FILEDROP image temp write failed: {ex.GetType().Name}: {ex.Message}");
+                    }
                 }
             }
         }
@@ -5362,17 +5443,22 @@ public partial class PopupWindow : Window
     {
         try
         {
-            if (entry.Type == EntryType.Image && entry.ImageData is { Length: > 0 } bytes)
+            if (entry.Type == EntryType.Image)
             {
-                using var ms = new MemoryStream(bytes);
-                var bi = new BitmapImage();
-                bi.BeginInit();
-                bi.StreamSource = ms;
-                bi.CacheOption = BitmapCacheOption.OnLoad;
-                bi.DecodePixelWidth = 520;
-                bi.EndInit();
-                bi.Freeze();
-                return bi;
+                var bytes = entry.TryGetImageData();
+                if (bytes is { Length: > 0 })
+                {
+                    using var ms = new MemoryStream(bytes);
+                    var bi = new BitmapImage();
+                    bi.BeginInit();
+                    bi.StreamSource = ms;
+                    bi.CacheOption = BitmapCacheOption.OnLoad;
+                    bi.DecodePixelWidth = 520;
+                    bi.EndInit();
+                    bi.Freeze();
+                    return bi;
+                }
+                return null;
             }
 
             if (entry.IsImageFile && entry.FilePaths!.Length > 0)
@@ -5941,7 +6027,7 @@ public partial class PopupWindow : Window
         ClipboardDiagnosticsLog.Write(item.Type switch
         {
             EntryType.Text => $"paste BEGIN Text len={item.TextContent?.Length ?? 0} target=0x{tgt:X} gwFocus={Win32.GetForegroundWindow().ToInt64():X}",
-            EntryType.Image => $"paste BEGIN Image pngBytes={item.ImageData?.Length ?? 0} target=0x{tgt:X}",
+            EntryType.Image => $"paste BEGIN Image pngBytes={item.TryGetImageData()?.Length ?? 0} target=0x{tgt:X}",
             EntryType.Files => $"paste BEGIN Files {SummarizeFileDropForLog(item.FilePaths ?? [])} target=0x{tgt:X}",
             _ => $"paste BEGIN type={item.Type} target=0x{tgt:X}"
         });
@@ -5952,7 +6038,7 @@ public partial class PopupWindow : Window
         if (_targetWindow != IntPtr.Zero)
             Win32.SetForegroundWindowAggressive(_targetWindow);
         var textLen = item.TextContent?.Length ?? 0;
-        var imgBytes = item.ImageData?.Length ?? 0;
+        var imgBytes = (item.Type == EntryType.Image ? item.TryGetImageData()?.Length : null) ?? 0;
         var imgPixels = item.Type == EntryType.Image ? item.ImageWidth * item.ImageHeight : 0;
         var hugeClipboardImage = item.Type == EntryType.Image && (imgBytes > 900_000 || imgPixels > 1_200_000);
         var noSegmentDelays = sequentialSegmentIndex >= 0;
@@ -6010,7 +6096,13 @@ public partial class PopupWindow : Window
                     // BitmapImage + OnLoad 在 EndInit 时把像素读入内存，Freeze 后可安全关闭流再写剪贴板。
                     BitmapImage? bi = null;
                     var swDec = Stopwatch.StartNew();
-                    using (var ms = new MemoryStream(item.ImageData!))
+                    var pasteImgData = item.TryGetImageData();
+                    if (pasteImgData is not { Length: > 0 })
+                    {
+                        ClipboardDiagnosticsLog.Write("paste image: no image data available");
+                        break;
+                    }
+                    using (var ms = new MemoryStream(pasteImgData))
                     {
                         bi = new BitmapImage();
                         bi.BeginInit();
@@ -6022,10 +6114,10 @@ public partial class PopupWindow : Window
                     if (bi == null) break;
                     if (bi.CanFreeze) bi.Freeze();
                     ClipboardDiagnosticsLog.Write(
-                        $"paste image loadMs={swDec.ElapsedMilliseconds} frame={bi.PixelWidth}x{bi.PixelHeight} storedPng={item.ImageData?.Length ?? 0}");
+                        $"paste image loadMs={swDec.ElapsedMilliseconds} frame={bi.PixelWidth}x{bi.PixelHeight} storedPng={pasteImgData.Length}");
                     clipboardOk = await TrySetClipboardImageWithNativeFallbackAsync(
                         bi,
-                        item.ImageData,
+                        pasteImgData,
                         _hwnd,
                         maxRetries: clipRetries,
                         baseDelayMs: clipRetryDelayMs);
@@ -6255,7 +6347,8 @@ public partial class PopupWindow : Window
     private async void PasteImageAsFileForExplorer()
     {
         if (ItemsList.SelectedItem is not ClipboardEntry item || item.Type != EntryType.Image) return;
-        if (item.ImageData is not { Length: > 0 }) return;
+        var explorerImgData = item.TryGetImageData();
+        if (explorerImgData is not { Length: > 0 }) return;
         _pasteInProgress = true;
         var deferClear = false;
         try
@@ -6281,13 +6374,13 @@ public partial class PopupWindow : Window
         var path = Path.Combine(dir, $"clip_{DateTime.Now:yyyyMMdd_HHmmss}.png");
         try
         {
-            File.WriteAllBytes(path, item.ImageData);
+            File.WriteAllBytes(path, explorerImgData);
         }
         catch { return; }
 
         deferClear = await CompletePasteTempFileToExplorerAsync(
             path,
-            $"pngBytes={item.ImageData?.Length ?? 0}",
+            $"pngBytes={explorerImgData.Length}",
             $"explorer_temp_png file=\"{path}\"");
         }
         finally

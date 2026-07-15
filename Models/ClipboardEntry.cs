@@ -8,12 +8,70 @@ namespace ClipboardManager;
 
 public enum EntryType { Text, Image, Files }
 
-public class ClipboardEntry : INotifyPropertyChanged
-{
-    public EntryType Type { get; set; }
-    public string? TextContent { get; set; }
-    public byte[]? ImageData { get; set; }
-    public string[]? FilePaths { get; set; }
+    public class ClipboardEntry : INotifyPropertyChanged
+    {
+        public EntryType Type { get; set; }
+        public string? TextContent { get; set; }
+
+        private byte[]? _imageData;
+
+        /// <summary>
+        /// 图片 PNG 字节数据。当启用懒加载时，此值可能为 null——
+        /// 需通过 <see cref="TryGetImageData"/> 获取，会按需从数据库加载。
+        /// </summary>
+        public byte[]? ImageData
+        {
+            get => _imageData;
+            set
+            {
+                _imageData = value;
+                _imageDataLoaded = value != null;
+            }
+        }
+
+        /// <summary>标记 ImageData 是否已加载（懒加载场景下区分「未加载」与「无图片」）。</summary>
+        private bool _imageDataLoaded;
+
+        /// <summary>
+        /// 懒加载委托：传入 PersistedId，返回图片 byte[]。由 PopupWindow 在启动时设置。
+        /// </summary>
+        [System.Xml.Serialization.XmlIgnore]
+        public Func<long, byte[]?>? ImageDataLoader { get; set; }
+
+        /// <summary>
+        /// 获取图片数据：如果已在内存中则直接返回，否则通过懒加载委托从数据库按需读取。
+        /// 调用方使用完毕后应通过 <see cref="ReleaseImageData"/> 释放。
+        /// </summary>
+        public byte[]? TryGetImageData()
+        {
+            if (_imageData != null) return _imageData;
+            if (Type != EntryType.Image || PersistedId is not long id || id <= 0) return null;
+            if (_imageDataLoaded) return null; // 已尝试过，确实无数据
+
+            // 懒加载：从数据库获取
+            if (ImageDataLoader != null)
+            {
+                _imageData = ImageDataLoader(id);
+                _imageDataLoaded = true;
+                return _imageData;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 释放图片原始数据以降低内存占用，下次需要时通过懒加载重新获取。
+        /// 保留缩略图（弱引用会自行管理），保留 OCR 文本等元数据。
+        /// </summary>
+        public void ReleaseImageData()
+        {
+            if (PersistedId is long id && id > 0 && ImageDataLoader != null)
+            {
+                _imageData = null;
+                _imageDataLoaded = false;
+            }
+        }
+
+        public string[]? FilePaths { get; set; }
 
     private string? _imageMd5Hex;
     /// <summary>PNG 图像字节的 MD5（小写十六进制），惰性计算；用于历史项去重。</summary>
@@ -21,9 +79,12 @@ public class ClipboardEntry : INotifyPropertyChanged
     {
         get
         {
-            if (Type != EntryType.Image || ImageData is not { Length: > 0 }) return null;
+            if (Type != EntryType.Image) return null;
+            // 懒加载场景：ImageData 可能为 null，尝试按需获取
+            var data = TryGetImageData();
+            if (data is not { Length: > 0 }) return null;
             if (_imageMd5Hex != null) return _imageMd5Hex;
-            _imageMd5Hex = ComputeImageBytesMd5Hex(ImageData);
+            _imageMd5Hex = ComputeImageBytesMd5Hex(data);
             return _imageMd5Hex;
         }
     }
@@ -145,17 +206,38 @@ public class ClipboardEntry : INotifyPropertyChanged
     public string BatchOrderLabel => _batchOrder > 0 ? _batchOrder.ToString() : "";
 
     private BitmapSource? _thumbnail;
+    private WeakReference<BitmapSource>? _thumbnailRef;
 
+    /// <summary>
+    /// 缩略图获取：使用弱引用缓存，内存压力大时 GC 可自动回收缩略图，需要时重新解码。
+    /// 这比永久持有 _thumbnail 更省内存——每张缩略图虽仅约 16KB，
+    /// 但当历史记录含数百张图片时可显著降低常驻内存。
+    /// </summary>
     public BitmapSource? Thumbnail
     {
         get
         {
-            if (_thumbnail == null)
+            // 尝试从弱引用取回
+            if (_thumbnailRef != null && _thumbnailRef.TryGetTarget(out var cached))
+                return cached;
+            if (_thumbnail != null) return _thumbnail;
+
+            BitmapSource? t = null;
+            // 关键：用 Type == EntryType.Image 判断，而不是 ImageData != null。
+            // 懒加载场景下 ImageData 在启动时为 null（仅元数据从数据库加载），
+            // 若用 ImageData != null 判断会导致图片条目永远拿不到缩略图（视觉回归）。
+            // CreateThumbnail 内部会调用 TryGetImageData 按需从数据库读取，
+            // 生成 64px 缩略图后立即释放原始字节，避免常驻内存。
+            if (Type == EntryType.Image) t = CreateThumbnail();
+            else if (IsImageFile) t = CreateFileThumbnail();
+
+            if (t != null)
             {
-                if (ImageData != null) _thumbnail = CreateThumbnail();
-                else if (IsImageFile) _thumbnail = CreateFileThumbnail();
+                // 优先用弱引用，让 GC 在内存压力时可以回收
+                _thumbnailRef = new WeakReference<BitmapSource>(t);
+                _thumbnail = null; // 不再强持有
             }
-            return _thumbnail;
+            return t;
         }
     }
 
@@ -362,7 +444,13 @@ public class ClipboardEntry : INotifyPropertyChanged
     {
         try
         {
-            using var ms = new MemoryStream(ImageData!);
+            // 记录是否为懒加载场景：ImageData 在调用前为 null，
+            // 表示需要从数据库读取。读取后释放，避免常驻内存。
+            // 新捕获的图片（ImageData 已在内存）不释放——便于立即粘贴无需重新读 DB。
+            bool wasLazy = _imageData == null;
+            var data = TryGetImageData();
+            if (data is not { Length: > 0 }) return null;
+            using var ms = new MemoryStream(data);
             var bi = new BitmapImage();
             bi.BeginInit();
             bi.StreamSource = ms;
@@ -370,6 +458,12 @@ public class ClipboardEntry : INotifyPropertyChanged
             bi.DecodePixelWidth = 64;
             bi.EndInit();
             bi.Freeze();
+
+            // 缩略图已生成并冻结为独立对象，原始 PNG 字节不再需要。
+            // 懒加载场景下释放以降低常驻内存；下次需要完整图片（预览/粘贴）时再从 DB 加载。
+            if (wasLazy)
+                ReleaseImageData();
+
             return bi;
         }
         catch { return null; }

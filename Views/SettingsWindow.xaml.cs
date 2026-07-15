@@ -84,6 +84,7 @@ public partial class SettingsWindow : Window
 #endif
 
         MaxItemsBox.Text = settings.MaxItems.ToString();
+        MaxImageItemsBox.Text = settings.MaxImageItems.ToString();
         _pendingModifiers = settings.HotkeyModifiers;
         _pendingKey = settings.HotkeyKey;
         HotkeyText.Text = settings.HotkeyDisplayName;
@@ -1063,6 +1064,13 @@ public partial class SettingsWindow : Window
             return;
         }
 
+        if (!int.TryParse(MaxImageItemsBox.Text, out var maxImageItems) || maxImageItems < 0 || maxImageItems > 5000)
+        {
+            System.Windows.MessageBox.Show("最大图片条数应在 0 ~ 5000 之间（0=不限制）", "提示",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
         if (!int.TryParse(PreviewLinesBox.Text, out var previewLines) || previewLines < 1 || previewLines > 10)
         {
             System.Windows.MessageBox.Show("预览行数应在 1 ~ 10 之间", "提示",
@@ -1151,6 +1159,7 @@ public partial class SettingsWindow : Window
         }
 
         _settings.MaxItems = maxItems;
+        _settings.MaxImageItems = maxImageItems;
         _settings.HotkeyModifiers = _pendingModifiers;
         _settings.HotkeyKey = _pendingKey;
         _settings.FileJumpHotkeyModifiers = _pendingFileJumpModifiers;

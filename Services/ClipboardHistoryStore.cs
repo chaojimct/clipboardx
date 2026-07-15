@@ -116,6 +116,116 @@ internal sealed class ClipboardHistoryStore
         return list;
     }
 
+    /// <summary>
+    /// 轻量加载：不读取 image_blob，仅加载元数据。图片数据按需通过 <see cref="LoadImageData"/> 获取。
+    /// 用于启动时大幅降低内存占用——图片条目仅在需要时才从数据库读取。
+    /// </summary>
+    public List<ClipboardEntry> LoadNewestFirstLite(int limit)
+    {
+        if (limit <= 0) return [];
+        var list = new List<ClipboardEntry>(Math.Min(limit, 64));
+        try
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            // 不查 image_blob 列，仅取元数据 + 文本/文件路径/OCR
+            cmd.CommandText =
+                """
+                SELECT id, entry_type, text_content, image_w, image_h, file_paths_json, copied_at_ms, ocr_text
+                FROM clipboard_history
+                ORDER BY copied_at_ms DESC
+                LIMIT @lim
+                """;
+            cmd.Parameters.AddWithValue("@lim", limit);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var entry = new ClipboardEntry
+                {
+                    PersistedId = r.GetInt64(0),
+                    Type = (EntryType)r.GetInt32(1),
+                    CopiedAt = FromMs(r.GetInt64(6)),
+                    IsQuickPaste = false
+                };
+                if (!r.IsDBNull(2)) entry.TextContent = r.GetString(2);
+                // ImageData 故意不加载——标记为需要按需获取
+                entry.ImageData = entry.Type == EntryType.Image ? null : null;
+                entry.ImageWidth = r.IsDBNull(3) ? 0 : r.GetInt32(3);
+                entry.ImageHeight = r.IsDBNull(4) ? 0 : r.GetInt32(4);
+                if (!r.IsDBNull(5))
+                {
+                    var json = r.GetString(5);
+                    entry.FilePaths = JsonSerializer.Deserialize<string[]>(json) ?? [];
+                }
+                if (r.FieldCount > 7 && !r.IsDBNull(7))
+                    entry.OcrText = r.GetString(7);
+                list.Add(entry);
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+        return list;
+    }
+
+    /// <summary>按需加载单条图片的 PNG 字节数据。</summary>
+    public byte[]? LoadImageData(long persistedId)
+    {
+        if (persistedId <= 0) return null;
+        try
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT image_blob FROM clipboard_history WHERE id = @id";
+            cmd.Parameters.AddWithValue("@id", persistedId);
+            var result = cmd.ExecuteScalar();
+            return result as byte[];
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>删除超出图片条目专项上限的旧图片记录，返回被删除的 PersistedId 列表。</summary>
+    public List<long> PruneExcessImages(int maxImageKeep)
+    {
+        var deleted = new List<long>();
+        if (maxImageKeep < 0) return deleted;
+        try
+        {
+            using var conn = Open();
+            // 查出超出上限的图片条目 ID
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText =
+                """
+                SELECT id FROM clipboard_history
+                WHERE entry_type = @et
+                ORDER BY copied_at_ms DESC
+                LIMIT -1 OFFSET @lim
+                """;
+            cmd.Parameters.AddWithValue("@et", (int)EntryType.Image);
+            cmd.Parameters.AddWithValue("@lim", maxImageKeep);
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                deleted.Add(r.GetInt64(0));
+
+            if (deleted.Count == 0) return deleted;
+
+            // 批量删除
+            using var delCmd = conn.CreateCommand();
+            var ids = string.Join(",", deleted);
+            delCmd.CommandText = $"DELETE FROM clipboard_history WHERE id IN ({ids})";
+            delCmd.ExecuteNonQuery();
+        }
+        catch
+        {
+            // ignore
+        }
+        return deleted;
+    }
+
     /// <summary>仅保留按时间最新的 maxKeep 条，删除其余（与设置中的条数上限对齐）。</summary>
     public void PruneExcess(int maxKeep)
     {
