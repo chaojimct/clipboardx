@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 
+## [1.9.6] - 2026-08-04
+
+### 剪贴板 · 弹窗定位
+
+- **修复 Electron 应用弹窗错位**：CodeBuddy / Trae Work 等 Electron 应用呼出 ClipboardX 时弹窗落到主屏右上角或窗口左下角。根因是 UIA `FocusedElement.BoundingRectangle` 返回的是容器 div / 顶层窗口矩形而非真实 caret，被当作光标位置使用
+- **双判据识别容器矩形**：(1) `ClassName` 为空字符串 → 内部容器 div（CodeBuddy 模式）；(2) rect 与前台窗口矩形面积比 ≥ 0.95 → 顶层窗口矩形（Trae Work 模式）。任一命中即拒绝，落到鼠标兜底
+- **`GetGUIThreadInfo` 校验 caret 尺寸**：Electron 应用 `rcCaret = (0,0,0,0)` 不再被误认为有效光标
+- **不再依赖硬编码进程名白名单**：自动覆盖未来未知 Electron 应用
+
 ## [1.9.5] - 2026-07-15
 
 ### 剪贴板 · 内存优化

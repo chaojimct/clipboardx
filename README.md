@@ -329,6 +329,10 @@ dotnet publish ClipboardManager.csproj -c Release -r win-x64 \
 
 - **设置页布局修复**：「退出时自动清空历史」行不再被挤压为 10px 高度
 
+### v1.9.6
+
+- **弹窗定位修复**：CodeBuddy / Trae Work 等 Electron 应用呼出 ClipboardX 时弹窗错位（落到主屏右上角或窗口左下角）。通过 UIA `ClassName` 为空 + rect 与窗口面积比 ≥ 0.95 双判据识别容器矩形并拒绝，落到鼠标兜底；不再依赖硬编码进程名白名单
+
 ### v1.9.5
 
 - **内存优化**：修复 OCR 后台队列启动时把所有图片字节从数据库懒加载到内存（80-200MB），改为只在 Worker 处理该条时加载、处理完即释放；并修复缩略图在懒加载场景下不显示的回归

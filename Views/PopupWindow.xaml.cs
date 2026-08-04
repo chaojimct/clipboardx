@@ -2901,17 +2901,27 @@ public partial class PopupWindow : Window
 
         if (Win32.GetGUIThreadInfo(fgThread, ref gti) && gti.hwndCaret != IntPtr.Zero)
         {
-            var pt = new Win32.POINT { X = gti.rcCaret.Left, Y = gti.rcCaret.Bottom };
-            Win32.ClientToScreen(gti.hwndCaret, ref pt);
-            if (pt.X > 0 || pt.Y > 0)
+            // 校验 rcCaret 尺寸：Electron/Chromium 等无真实 Win32 caret 的应用，
+            // hwndCaret 常被填成主窗口、rcCaret 为 (0,0,0,0)，ClientToScreen 后会
+            // 返回窗口左上角而非真实光标位置（用户反馈的副屏全屏 CodeBuddy 呼出
+            // 弹窗落到主屏右上角即由此而来）。要求 rcCaret 有非零尺寸才认定为有效 caret。
+            // 真实 Win32 caret 通常为 1~2px 宽、16~20px 高，绝不会是 (0,0,0,0)。
+            bool hasCaretSize = gti.rcCaret.Right > gti.rcCaret.Left
+                               && gti.rcCaret.Bottom > gti.rcCaret.Top;
+            if (hasCaretSize)
             {
-                SetPositionWithOffset(pt.X, pt.Y + caretGap);
-                CacheCaretSuccess(_targetWindow, _pendingPhysX, _pendingPhysY);
-                #region agent log
-                AgentDbgLog("H23", "PositionPopup", "branch=GUIThreadInfoCaret",
-                    new { pt.X, pt.Y, _pendingPhysX, _pendingPhysY });
-                #endregion
-                return;
+                var pt = new Win32.POINT { X = gti.rcCaret.Left, Y = gti.rcCaret.Bottom };
+                Win32.ClientToScreen(gti.hwndCaret, ref pt);
+                if (pt.X > 0 || pt.Y > 0)
+                {
+                    SetPositionWithOffset(pt.X, pt.Y + caretGap);
+                    CacheCaretSuccess(_targetWindow, _pendingPhysX, _pendingPhysY);
+                    #region agent log
+                    AgentDbgLog("H23", "PositionPopup", "branch=GUIThreadInfoCaret",
+                        new { pt.X, pt.Y, _pendingPhysX, _pendingPhysY });
+                    #endregion
+                    return;
+                }
             }
         }
 
@@ -2988,6 +2998,77 @@ public partial class PopupWindow : Window
                || cls.Equals("WorkerW", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// 判断指定进程是否为 Chromium-based 应用（Electron / Chromium / Chrome / Edge 等）。
+    /// 这类应用的 UIA FocusedElement.BoundingRectangle 返回的是整个 BrowserWindow 矩形，
+    /// 而非真实光标位置，不能直接用作光标定位。识别方式：进程名匹配已知 Chromium 应用名，
+    /// 或加载了 chrome.dll / electron.exe 等模块。
+    /// </summary>
+    private static bool IsChromiumBasedProcess(int processId)
+    {
+        try
+        {
+            var proc = Process.GetProcessById(processId);
+            var name = proc.ProcessName;
+            // 已知 Chromium-based 应用进程名（不含扩展名，小写匹配）
+            switch (name.ToLowerInvariant())
+            {
+                case "codebuddy":
+                case "codebuddy cn":   // 国行版 CodeBuddy 进程名带空格 + CN 后缀
+                case "code":
+                case "code - insiders":
+                case "cursor":
+                case "windsurf":
+                case "msedge":
+                case "chrome":
+                case "slack":
+                case "discord":
+                case "teams":
+                case "spotify":
+                case "atom":
+                case "github desktop":
+                case "postman":
+                case "notion":
+                case "obsidian":
+                case "edge":
+                    return true;
+            }
+
+            // 兜底：进程名包含 "codebuddy"（覆盖未来可能的 CodeBuddy Pro / Dev 等变体）
+            if (name.IndexOf("codebuddy", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            // 兜底：检查主模块文件名是否包含 chromium 特征
+            try
+            {
+                var mainModule = proc.MainModule;
+                if (mainModule != null)
+                {
+                    var fn = mainModule.FileName ?? "";
+                    if (fn.IndexOf("electron", StringComparison.OrdinalIgnoreCase) >= 0
+                        || fn.IndexOf("chromium", StringComparison.OrdinalIgnoreCase) >= 0)
+                        return true;
+                }
+            }
+            catch
+            {
+                // 64位进程访问 32位进程模块会失败，忽略
+            }
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>[DIAG] 临时诊断辅助：安全获取进程名，避免访问失败时抛异常。</summary>
+    private static string GetProcessNameSafe(int processId)
+    {
+        try { return Process.GetProcessById(processId).ProcessName; }
+        catch { return "?"; }
+    }
+
     private static bool TryGetCaretByAutomation(out double x, out double y)
     {
         x = y = 0;
@@ -3011,13 +3092,63 @@ public partial class PopupWindow : Window
                         {
                             var rects = sel[0].GetBoundingRectangles();
                             if (rects.Length > 0 && (rects[0].X > 0 || rects[0].Y > 0))
-                                return (true, rects[0].X, rects[0].Bottom + 4, "text-sel");
+                            {
+                                var selRect = rects[0];
+                                // 判据：TextPattern 选区矩形的 ClassName 为空时，视为 Electron/Chromium
+                                // 容器返回的伪选区（日志验证：CodeBuddy ClassName='' 返回 1920x1032 容器矩形）。
+                                // 真实输入控件（mmui::ChatInputField / TermControl / WPF Edit 等）都有 ClassName。
+                                // 注意：不能仅靠尺寸判别——终端 TermControl 矩形 2346x1142 比 CodeBuddy 还大但是合法的。
+                                if (string.IsNullOrEmpty(focused.Current.ClassName))
+                                {
+                                    ClipboardDiagnosticsLog.Write(
+                                        $"[CLIPX_DIAG] text-sel reject empty-cls " +
+                                        $"proc={GetProcessNameSafe(focused.Current.ProcessId)} " +
+                                        $"selRect=({selRect.X:F0},{selRect.Y:F0},{selRect.Width:F0}x{selRect.Height:F0})");
+                                    return (false, 0, 0, "text-sel-empty-cls");
+                                }
+                                return (true, selRect.X, selRect.Bottom + 4, "text-sel");
+                            }
                         }
                     }
 
+                    // FocusedElement 没有 TextPattern 时，退化到 BoundingRectangle。
+                    // 对大多数 Win32/WinForm/WPF 输入控件，这个矩形就是控件本身，可作为光标位置使用。
+                    // 但对 Electron/Chromium 应用，FocusedElement 可能返回非 caret 的容器矩形：
+                    //   (1) CodeBuddy: ClassName='' 的内部 div，矩形 1920x1032
+                    //   (2) Trae Work: ClassName='Chrome_WidgetWin_1' 的顶层窗口，矩形 = fgRect，cover=1.0
+                    // 用双判据覆盖两种模式：
+                    //   - ClassName 为空 → 容器 div（CodeBuddy 模式）
+                    //   - rect 与前台窗口矩形面积比 ≥ 0.95 → 窗口级矩形（Trae Work 模式）
+                    // 真实输入控件（mmui::ChatInputField cover=0.14 / TermControl cover=0.91）都不会被误判。
                     var rect = focused.Current.BoundingRectangle;
                     if (!rect.IsEmpty && rect.Width > 0 && rect.Height > 0)
+                    {
+                        // [DIAG] 始终输出 bound-rect 详细信息 + 前台窗口矩形对比，用于发现新场景问题
+                        var fgHwnd2 = Win32.GetForegroundWindow();
+                        Win32.GetWindowRect(fgHwnd2, out var fgRect2);
+                        double fgArea2 = (double)(fgRect2.Right - fgRect2.Left) * (fgRect2.Bottom - fgRect2.Top);
+                        double rectArea2 = rect.Width * rect.Height;
+                        double coverRatio2 = fgArea2 > 0 ? rectArea2 / fgArea2 : 0;
+                        bool clsEmpty = string.IsNullOrEmpty(focused.Current.ClassName);
+                        bool windowLevel = coverRatio2 >= 0.95;
+                        ClipboardDiagnosticsLog.Write(
+                            $"[CLIPX_DIAG] bound-rect pid={focused.Current.ProcessId} " +
+                            $"proc={GetProcessNameSafe(focused.Current.ProcessId)} " +
+                            $"cls='{focused.Current.ClassName}' clsEmpty={clsEmpty} " +
+                            $"rect=({rect.X:F0},{rect.Y:F0},{rect.Width:F0}x{rect.Height:F0}) " +
+                            $"fgRect=({fgRect2.Left},{fgRect2.Top},{fgRect2.Right - fgRect2.Left}x{fgRect2.Bottom - fgRect2.Top}) " +
+                            $"cover={coverRatio2:F2} windowLevel={windowLevel}");
+
+                        if (clsEmpty)
+                        {
+                            return (false, 0, 0, "bound-rect-empty-cls");
+                        }
+                        if (windowLevel)
+                        {
+                            return (false, 0, 0, "bound-rect-window-level");
+                        }
                         return (true, rect.X + 20, rect.Bottom + 4, "bound-rect");
+                    }
 
                     return (false, 0, 0, "no-pattern-no-rect");
                 }
@@ -3070,13 +3201,18 @@ public partial class PopupWindow : Window
 
     private void SetPositionWithOffset(double physX, double physY)
     {
-        var screen = System.Windows.Forms.Screen.FromPoint(
-            new System.Drawing.Point((int)physX, (int)physY));
-        var work = screen.WorkingArea;
-
+        // 注意：必须用 Win32 MonitorFromPoint + GetMonitorInfo 拿 rcWork，
+        // 而非 System.Windows.Forms.Screen.WorkingArea —— 后者在 per-monitor DPI 高分屏
+        // 上返回的是逻辑坐标（DIP），与函数内全程使用的物理像素坐标不一致，
+        // 会导致 y + popupH > work.Bottom 误触发，弹窗被错误上推到主显示器顶部。
         var hMon = Win32.MonitorFromPoint(
             new Win32.POINT { X = (int)physX, Y = (int)physY },
             Win32.MONITOR_DEFAULTTONEAREST);
+        var mi = new Win32.MONITORINFO { cbSize = Marshal.SizeOf<Win32.MONITORINFO>() };
+        var work = Win32.GetMonitorInfo(hMon, ref mi)
+            ? mi.rcWork
+            : new Win32.RECT { Left = 0, Top = 0, Right = 65535, Bottom = 65535 };
+
         Win32.GetDpiForMonitor(hMon, 0, out uint monDpiX, out uint monDpiY);
         double scaleX = monDpiX / 96.0;
         double scaleY = monDpiY / 96.0;
