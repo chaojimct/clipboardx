@@ -329,6 +329,10 @@ dotnet publish ClipboardManager.csproj -c Release -r win-x64 \
 
 - **设置页布局修复**：「退出时自动清空历史」行不再被挤压为 10px 高度
 
+### v1.9.7
+
+- **管理员权限开机自启改用任务计划程序**：之前用 HKCU Run + PowerShell RunAs，登录阶段 UAC 阻塞导致自启失败。改用 `schtasks /Create /SC ONLOGON /RL HIGHEST`，由 Task Scheduler 提权启动，不弹 UAC
+
 ### v1.9.6
 
 - **弹窗定位修复**：CodeBuddy / Trae Work 等 Electron 应用呼出 ClipboardX 时弹窗错位（落到主屏右上角或窗口左下角）。通过 UIA `ClassName` 为空 + rect 与窗口面积比 ≥ 0.95 双判据识别容器矩形并拒绝，落到鼠标兜底；不再依赖硬编码进程名白名单

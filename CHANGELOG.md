@@ -6,6 +6,18 @@
 
 ## [Unreleased]
 
+## [1.9.7] - 2026-08-04
+
+### 开机自启
+
+- **管理员权限自启改用任务计划程序**：之前 `RunAsAdministrator=true` 时写入 HKCU Run 键 + PowerShell `Start-Process -Verb RunAs`，登录阶段 UAC 无法稳定显示同意弹窗，自启会被静默拦截。改为注册任务计划程序（`schtasks /Create /SC ONLOGON /RL HIGHEST`），由 Task Scheduler 以最高权限启动，不弹 UAC
+- **切换方式时自动清理另一种方式**：从「管理员」切到「普通」会自动删除已注册的任务；反之亦然，避免残留
+- 拆分 `IsRegistered()` / `IsRunKeyRegistered()` / `IsScheduledTaskRegistered()` 查询方法
+
+### 设置页
+
+- 设置页布局调整：新增 RowDefinition + 后续元素行号位移
+
 ## [1.9.6] - 2026-08-04
 
 ### 剪贴板 · 弹窗定位
