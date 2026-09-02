@@ -142,16 +142,36 @@ public sealed class ExplorerQuickFindController : IDisposable
         _hookWParam = wParam;
         _hookLParam = lParam;
 
+        // F2（重命名）按下后记录时间与前台：Explorer 把焦点移到重命名编辑框有延迟，
+        // 用户立即输入首字符时焦点可能仍在文件列表，误判为“输入即搜索”启动会话后
+        // 会吞掉全部按键，重命名无法进行。短时间内不启动会话。
+        if (kb.vkCode == 0x71)
+        {
+            _lastRenameF2Tick = Environment.TickCount;
+            _lastRenameF2Foreground = fg;
+        }
+
         if (_sessionActive)
             return HandleSessionKeyInHook(fg, kb);
 
         return TryStartSessionInHook(fg, kb);
     }
 
+    private int _lastRenameF2Tick = int.MinValue;
+    private IntPtr _lastRenameF2Foreground;
+
     /// <summary>已在会话中：快速决策是否吞键。会话期间全面接管键盘，防止 Explorer 处理任何按键。</summary>
     private IntPtr HandleSessionKeyInHook(IntPtr fg, Win32.KBDLLHOOKSTRUCT kb)
     {
         if (!IsStillTargetExplorer(fg))
+        {
+            _dispatcher.BeginInvoke(EndSession);
+            return PassThrough();
+        }
+
+        // 焦点已落入可编辑控件（F2 重命名框迟到就绪、或用户点击了地址栏/搜索框）：
+        // 立即结束会话并把按键还给 Explorer，避免吞掉重命名/地址栏输入。
+        if (!QuickCheckFocusNotEditBox(_sessionExplorerFrame))
         {
             _dispatcher.BeginInvoke(EndSession);
             return PassThrough();
@@ -241,6 +261,10 @@ public sealed class ExplorerQuickFindController : IDisposable
         if (isDesktop)
         {
             frame = fg;
+            // 桌面重命名（F2）同样会弹 Edit 编辑框，此前桌面路径未做焦点检查，
+            // 导致重命名输入被吞、误触发全盘搜索。
+            if (!QuickCheckFocusNotEditBox(frame))
+                return PassThrough();
         }
         else
         {
@@ -251,6 +275,13 @@ public sealed class ExplorerQuickFindController : IDisposable
             if (!QuickCheckFocusNotEditBox(frame))
                 return PassThrough();
         }
+
+        // F2 刚在同一个资源管理器/桌面窗口按下（重命名框可能尚未获得焦点），
+        // 抑制会话启动，把字符留给重命名编辑框。
+        var sinceF2 = unchecked(Environment.TickCount - _lastRenameF2Tick);
+        if (sinceF2 >= 0 && sinceF2 < 1500
+            && (_lastRenameF2Foreground == fg || _lastRenameF2Foreground == frame))
+            return PassThrough();
 
         CaptureKeyState(kb, out var keyState);
         if (!TryGetChar(kb.vkCode, kb.scanCode, keyState, out var ch) || ch < ' ')
@@ -999,7 +1030,15 @@ public sealed class ExplorerQuickFindController : IDisposable
             return true; // 取不到就放行，让后续异步检测做最终判断
 
         var focus = gti.hwndFocus;
-        if (focus == IntPtr.Zero) return true; // Win11 DirectUI 下偶发
+        if (focus == IntPtr.Zero)
+        {
+            // Win11 DirectUI 下 focus 偶发为 0：焦点为 0 但该线程存在文本 caret
+            // （hwndCaret 非空或 rcCaret 非空）说明正在编辑文本（重命名/地址栏），不启动会话。
+            if (gti.hwndCaret != IntPtr.Zero
+                || (gti.rcCaret.Right > gti.rcCaret.Left && gti.rcCaret.Bottom > gti.rcCaret.Top))
+                return false;
+            return true;
+        }
 
         var cls = Win32.GetWindowClassName(focus);
         if (cls.Equals("Edit", StringComparison.Ordinal)) return false;
