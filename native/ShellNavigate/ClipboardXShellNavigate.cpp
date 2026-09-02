@@ -96,24 +96,9 @@ static HRESULT NavigateViaShellBrowser(HWND hDlg, PCWSTR pathW)
     NavLogFmtW(L"SendMessage WM_USER+7 hwnd=0x%p tidDlg=%lu tidRemote=%lu", (void*)hDlg,
         (unsigned long)tidWnd, (unsigned long)tidHere);
 
-    IUnknown* pUnk = reinterpret_cast<IUnknown*>(SendMessageW(hDlg, CWM_GETISHELLBROWSER, 0, 0));
-    if (!pUnk)
-    {
-        NavLogFmtW(L"No IUnknown from WM_USER+7");
-        return E_FAIL;
-    }
-
-    IShellBrowser* pSB = nullptr;
-    HRESULT hr = pUnk->QueryInterface(IID_IShellBrowser, reinterpret_cast<void**>(&pSB));
-    if (FAILED(hr) || !pSB)
-    {
-        NavLogFmtW(L"QueryInterface IShellBrowser hr=0x%08X", (unsigned)hr);
-        return hr;
-    }
-
     PIDLIST_ABSOLUTE pidl = nullptr;
     SFGAOF attrs = 0;
-    hr = SHParseDisplayName(pathW, nullptr, &pidl, 0, &attrs);
+    HRESULT hr = SHParseDisplayName(pathW, nullptr, &pidl, 0, &attrs);
     if (FAILED(hr) || !pidl)
     {
         NavLogFmtW(L"SHParseDisplayName hr=0x%08X, trying ILCreateFromPathW", (unsigned)hr);
@@ -122,28 +107,40 @@ static HRESULT NavigateViaShellBrowser(HWND hDlg, PCWSTR pathW)
     if (!pidl)
     {
         NavLogFmtW(L"no PIDL for path");
-        pSB->Release();
         return E_FAIL;
     }
 
-    constexpr HRESULT hrBusy = static_cast<HRESULT>(0x800700AA);
-    HRESULT hrBr = E_FAIL;
-    for (int attempt = 0; attempt < 4; ++attempt)
+    // 注意：本函数在 WH_GETMESSAGE 钩子回调中执行，即宿主进程对话框的 UI 线程。
+    // 此处绝不能 Sleep 重试——会把宿主程序整个消息泵堵死（表现为跳转几次后目标程序卡死）。
+    // hrBusy(0x800700AA) 等待视图就绪的重试由 C# 侧在后台线程完成：每次重试重新注入远程线程。
+    //
+    // pUnk 是对话框“借用”的指针：CWM_GETISHELLBROWSER 返回时并未 AddRef，
+    // 生命周期归对话框所有，调用方绝不能 Release。曾误当作泄漏补上 Release，
+    // 导致每次读/导航把宿主 ShellBrowser 引用计数非法 -1，几次操作后对象被提前
+    // 销毁，宿主（Edge 保存对话框子进程、微信）随即 0xc0000409 fail-fast 崩溃。
+    IUnknown* pUnk = reinterpret_cast<IUnknown*>(SendMessageW(hDlg, CWM_GETISHELLBROWSER, 0, 0));
+    if (!pUnk)
     {
-        if (attempt > 0)
-        {
-            NavLogFmtW(L"BrowseObject retry %d after hrBusy", attempt);
-            Sleep(100);
-        }
-        hrBr = pSB->BrowseObject(pidl, SBSP_ABSOLUTE);
-        NavLogFmtW(L"BrowseObject hr=0x%08X", (unsigned)hrBr);
-        if (hrBr != hrBusy)
-            break;
+        NavLogFmtW(L"No IUnknown from WM_USER+7");
+        ILFree(pidl);
+        return E_FAIL;
     }
 
-    ILFree(pidl);
+    IShellBrowser* pSB = nullptr;
+    HRESULT hrQ = pUnk->QueryInterface(IID_IShellBrowser, reinterpret_cast<void**>(&pSB));
+    if (FAILED(hrQ) || !pSB)
+    {
+        NavLogFmtW(L"QueryInterface IShellBrowser hr=0x%08X", (unsigned)hrQ);
+        ILFree(pidl);
+        return hrQ;
+    }
+
+    HRESULT hrNav = pSB->BrowseObject(pidl, SBSP_ABSOLUTE);
     pSB->Release();
-    return hrBr;
+    NavLogFmtW(L"BrowseObject hr=0x%08X", (unsigned)hrNav);
+
+    ILFree(pidl);
+    return hrNav;
 }
 
 // IShellBrowser from WM_USER+7 必须在对话框 UI 线程上使用；远程线程直调会出 S_OK 不刷新或 0x800700AA。
@@ -161,12 +158,13 @@ static HRESULT ReadCurrentFolderViaShellBrowser(HWND hDlg, WCHAR* outPath, int o
     outPath[0] = L'\0';
     constexpr UINT CWM_GETISHELLBROWSER = WM_USER + 7;
 
+    // pUnk 为对话框借用的指针（未 AddRef），不得 Release；详见 NavigateViaShellBrowser 处注释。
     IUnknown* pUnk = reinterpret_cast<IUnknown*>(SendMessageW(hDlg, CWM_GETISHELLBROWSER, 0, 0));
     if (!pUnk) return E_FAIL;
 
     IShellBrowser* pSB = nullptr;
     HRESULT hr = pUnk->QueryInterface(IID_IShellBrowser, reinterpret_cast<void**>(&pSB));
-    if (FAILED(hr) || !pSB) { pUnk->Release(); return hr; }
+    if (FAILED(hr) || !pSB) return hr;
 
     IShellView* pSV = nullptr;
     hr = pSB->QueryActiveShellView(&pSV);
@@ -210,6 +208,29 @@ static volatile LONG g_readHookArmed = 0;
 static HHOOK g_readMsgHook {};
 static ReadHookCtx g_readHookCtx {};
 
+// 并发远程线程（如采集轮询与点击采集同时读、或读+导航并发）会互相覆盖全局钩子上下文：
+// 后一个线程的 ZeroMemory 抹掉前一个的 hwnd/event，前者只能超时失败，更糟时
+// SetEvent/CloseHandle 会作用在已被替换的事件句柄上。用进程内匿名互斥把钩子式
+// 读/导航串行化（匿名内核对象天然进程私有，不影响其他宿主进程）。
+static HANDLE HookOpMutex()
+{
+    static HANDLE m = CreateMutexW(nullptr, FALSE, nullptr);
+    return m;
+}
+
+static bool AcquireHookOp(DWORD waitMs)
+{
+    HANDLE m = HookOpMutex();
+    if (!m) return true;
+    return WaitForSingleObject(m, waitMs) == WAIT_OBJECT_0;
+}
+
+static void ReleaseHookOp()
+{
+    HANDLE m = HookOpMutex();
+    if (m) ReleaseMutex(m);
+}
+
 static LRESULT CALLBACK ClipboardX_GetMsgProc(_In_ int code, _In_ WPARAM wp, _In_ LPARAM lp)
 {
     if (code < 0)
@@ -244,6 +265,13 @@ static HRESULT NavigateOnDialogUiThread(HWND hDlg, PCWSTR pathW)
     if (!ev)
         return E_FAIL;
 
+    if (!AcquireHookOp(4000))
+    {
+        NavLogFmtW(L"nav hook mutex busy");
+        CloseHandle(ev);
+        return E_FAIL;
+    }
+
     ZeroMemory(&g_navHookCtx, sizeof(g_navHookCtx));
     g_navHookCtx.hwnd = hDlg;
     wcsncpy_s(g_navHookCtx.path, pathW, _TRUNCATE);
@@ -256,12 +284,13 @@ static HRESULT NavigateOnDialogUiThread(HWND hDlg, PCWSTR pathW)
     {
         NavLogFmtW(L"SetWindowsHookEx WH_GETMESSAGE failed err=%lu", (unsigned long)GetLastError());
         CloseHandle(ev);
+        ReleaseHookOp();
         return E_FAIL;
     }
 
     PostMessageW(hDlg, WM_NULL, 0, 0);
 
-    const DWORD w = WaitForSingleObject(ev, 20000);
+    const DWORD w = WaitForSingleObject(ev, 5000);
     if (w != WAIT_OBJECT_0)
     {
         NavLogFmtW(L"nav hook wait %lu (timeout=%d)", (unsigned long)w, w == WAIT_TIMEOUT ? 1 : 0);
@@ -269,11 +298,17 @@ static HRESULT NavigateOnDialogUiThread(HWND hDlg, PCWSTR pathW)
         if (hLeft)
             UnhookWindowsHookEx(hLeft);
         InterlockedExchange(&g_navHookArmed, 0);
+        g_navHookCtx.doneEvent = nullptr;
+        // 迟到的钩子回调可能仍持有 ev：CloseHandle 会让其对已销毁句柄 SetEvent（UB）。
+        // 超时仅在宿主 UI 线程卡死时发生，此处故意泄漏一个事件对象换取安全。
+        ReleaseHookOp();
+        return E_FAIL;
     }
 
     const HRESULT hr = g_navHookCtx.hrResult;
     CloseHandle(ev);
     g_navHookCtx.doneEvent = nullptr;
+    ReleaseHookOp();
     return hr;
 }
 
@@ -314,6 +349,13 @@ static HRESULT ReadOnDialogUiThread(HWND hDlg, WCHAR* outPath, int outPathChars)
     if (!ev)
         return E_FAIL;
 
+    if (!AcquireHookOp(4000))
+    {
+        NavLogFmtW(L"read hook mutex busy");
+        CloseHandle(ev);
+        return E_FAIL;
+    }
+
     ZeroMemory(&g_readHookCtx, sizeof(g_readHookCtx));
     g_readHookCtx.hwnd = hDlg;
     g_readHookCtx.doneEvent = ev;
@@ -325,6 +367,7 @@ static HRESULT ReadOnDialogUiThread(HWND hDlg, WCHAR* outPath, int outPathChars)
     {
         NavLogFmtW(L"SetWindowsHookEx WH_GETMESSAGE read failed err=%lu", (unsigned long)GetLastError());
         CloseHandle(ev);
+        ReleaseHookOp();
         return E_FAIL;
     }
 
@@ -338,7 +381,9 @@ static HRESULT ReadOnDialogUiThread(HWND hDlg, WCHAR* outPath, int outPathChars)
         if (hLeft)
             UnhookWindowsHookEx(hLeft);
         InterlockedExchange(&g_readHookArmed, 0);
-        CloseHandle(ev);
+        g_readHookCtx.doneEvent = nullptr;
+        // 同导航路径：迟到的钩子回调可能仍持有 ev，超时路径故意泄漏事件对象避免 SetEvent 作用于已销毁句柄。
+        ReleaseHookOp();
         return E_FAIL;
     }
 
@@ -347,6 +392,7 @@ static HRESULT ReadOnDialogUiThread(HWND hDlg, WCHAR* outPath, int outPathChars)
         wcsncpy_s(outPath, outPathChars, g_readHookCtx.path, _TRUNCATE);
     CloseHandle(ev);
     g_readHookCtx.doneEvent = nullptr;
+    ReleaseHookOp();
     return hr;
 }
 

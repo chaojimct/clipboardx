@@ -197,9 +197,15 @@ internal static class FileDialogJumpHelper
 
         var className = Win32.GetWindowClassName(hwnd);
 
-        // #32770 也归入 WpsCustom（后备方法更丰富），注入由 TryNavigateToFolder 按类名单独处理
+        // WPS 进程内的 #32770 也可能是原生消息框（保存确认、错误提示等）。
+        // 此前无条件归入 WpsCustom 会导致自动跳转向消息框发送按键（Enter 直接点中「保存/确定」）。
+        // 现在要求标题像文件对话框，或子控件形态像文件对话框（消息框只有 Static+Button）。
+        // 注入不受影响：TryNavigateToFolder 仍按 #32770 类名单独尝试注入。
         if (className.Equals("#32770", StringComparison.Ordinal))
-            return true;
+        {
+            if (IsWpsFileDialogTitle(Win32.GetWindowText(hwnd))) return true;
+            return HasFileDialogishChildControls(hwnd);
+        }
 
         var title = Win32.GetWindowText(hwnd);
         if (IsWpsFileDialogTitle(title))
@@ -208,20 +214,52 @@ internal static class FileDialogJumpHelper
         if (!IsWpsQtLikeWindowClass(className))
             return false;
 
+        // Qt 窗口先做形态校验，排除加载框/气泡/进度/确认框等小型或辅助窗口
+        //（Qt5QWindowToolSaveBits 为 tooltip/辅助窗口类）。
+        if (!LooksLikeWpsQtFileDialogWindow(hwnd, className))
+            return false;
+
         if (!string.IsNullOrEmpty(title)
             && (title.Contains("打开", StringComparison.Ordinal)
-                || title.Contains("另存", StringComparison.Ordinal)
-                || title.Contains("保存", StringComparison.Ordinal)))
+                || title.Contains("另存", StringComparison.Ordinal)))
             return true;
 
         // WPS Qt5 自绘对话框：GetWindowText 为空且 UIA 不可用。
         // WPS 主窗口/首页/新建页同样是空标题 Qt 窗口，需排除：
         // 文件对话框由主窗口弹出，有 owner；主窗口/首页无 owner。
-        if (string.IsNullOrEmpty(title)
-            && Win32.GetWindow(hwnd, Win32.GW_OWNER) != IntPtr.Zero)
-            return true;
+        return string.IsNullOrEmpty(title)
+            && Win32.GetWindow(hwnd, Win32.GW_OWNER) != IntPtr.Zero;
+    }
 
-        return false;
+    /// <summary>#32770 是否带文件对话框特征子控件（地址栏/文件名输入/Shell 视图）；纯 Static+Button 的消息框返回 false。</summary>
+    private static bool HasFileDialogishChildControls(IntPtr hwnd)
+    {
+        var found = false;
+        Win32.EnumChildWindows(hwnd, (child, _) =>
+        {
+            var cls = Win32.GetWindowClassName(child);
+            if (cls.Contains("Edit", StringComparison.OrdinalIgnoreCase)
+                || cls.Contains("ComboBox", StringComparison.OrdinalIgnoreCase)
+                || cls.Contains("SysListView32", StringComparison.OrdinalIgnoreCase)
+                || cls.Contains("DirectUIHWND", StringComparison.OrdinalIgnoreCase)
+                || cls.Contains("SHELLDLL_DefView", StringComparison.OrdinalIgnoreCase)
+                || cls.Contains("ToolbarWindow32", StringComparison.OrdinalIgnoreCase))
+            {
+                found = true;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    /// <summary>WPS Qt 窗口形态是否像文件对话框：可见、已启用、非辅助窗口类、尺寸达到对话框级别。</summary>
+    private static bool LooksLikeWpsQtFileDialogWindow(IntPtr hwnd, string className)
+    {
+        if (className.Contains("ToolSaveBits", StringComparison.Ordinal)) return false;
+        if (!Win32.IsWindowVisible(hwnd) || !Win32.IsWindowEnabled(hwnd)) return false;
+        if (!Win32.GetWindowRect(hwnd, out var r)) return false;
+        return r.Right - r.Left >= 360 && r.Bottom - r.Top >= 240;
     }
 
     private static HashSet<string> CollectDescendantClassNames(IntPtr root)
@@ -747,7 +785,10 @@ internal static class FileDialogJumpHelper
     }
 
     /// <param name="allowShellInject">为 false 时不注入宿主进程，仅走 UIA/地址栏等模拟（兼容拦截注入的环境）。</param>
-    public static bool TryNavigateToFolder(IntPtr dialogHwnd, string folderPath, bool allowShellInject = true)
+    /// <param name="allowKeyboardFallback">为 false（自动同步等无人值守场景）时仅允许注入导航，
+    /// 跳过一切模拟输入回退：焦点不在地址栏时 Enter 会误触「打开/保存」直接关掉用户正在操作的对话框。</param>
+    public static bool TryNavigateToFolder(IntPtr dialogHwnd, string folderPath, bool allowShellInject = true,
+        bool allowKeyboardFallback = true)
     {
         var path = NormalizeFolderPathForNavigation(folderPath);
         if (!Directory.Exists(path)) return false;
@@ -766,7 +807,7 @@ internal static class FileDialogJumpHelper
             : null;
 
         if (kind == FileDialogKind.None && customRule != null)
-            return TryNavigateCustomRule(dialogHwnd, path, allowShellInject, customRule);
+            return TryNavigateCustomRule(dialogHwnd, path, allowShellInject, allowKeyboardFallback, customRule);
 
         if (kind == FileDialogKind.None) return false;
 
@@ -785,6 +826,13 @@ internal static class FileDialogJumpHelper
                     $"shell inject reached target despite failure status path=\"{path}\" hwnd=0x{dialogHwnd.ToInt64():X}");
                 return true;
             }
+        }
+
+        if (!allowKeyboardFallback)
+        {
+            ShellNavigateLog.Write("filejump",
+                $"injection-only navigation gave up (simulated-input fallback disabled) path=\"{path}\" hwnd=0x{dialogHwnd.ToInt64():X}");
+            return false;
         }
 
         if (kind == FileDialogKind.SysListView)
@@ -875,11 +923,12 @@ internal static class FileDialogJumpHelper
         IntPtr dialogHwnd,
         string path,
         bool allowShellInject,
+        bool allowKeyboardFallback,
         CustomFileDialogRule rule)
     {
         foreach (var s in BuildCustomStrategyOrder(rule))
         {
-            if (TryApplyCustomDialogStrategy(s, dialogHwnd, path, allowShellInject))
+            if (TryApplyCustomDialogStrategy(s, dialogHwnd, path, allowShellInject, allowKeyboardFallback))
                 return true;
         }
 
@@ -890,9 +939,13 @@ internal static class FileDialogJumpHelper
         string strategyId,
         IntPtr dialogHwnd,
         string normalizedExistingDir,
-        bool allowShellInject)
+        bool allowShellInject,
+        bool allowKeyboardFallback = true)
     {
         var id = strategyId.Trim().ToLowerInvariant();
+        // 无人值守（自动同步）仅允许注入策略，其余策略都含模拟输入，可能误触对话框按钮。
+        if (!allowKeyboardFallback && id != "shell_inject")
+            return false;
         try
         {
             switch (id)
@@ -1384,6 +1437,25 @@ internal static class FileDialogJumpHelper
         SendCtrlL();
         Thread.Sleep(140);
 
+        // 焦点安全闸：Ctrl+L 不一定把焦点送到地址栏（部分宿主忽略该快捷键）。
+        // 焦点仍在文件列表/文件名框时，后续盲打 Ctrl+A+路径+Enter 会把 Enter 送进
+        // 文件列表，直接点中「打开/保存」关掉用户正在操作的对话框。
+        if (!IsFocusSuitableForAddressTyping(dialogHwnd, dialogTid))
+        {
+            ShellNavigateLog.Write("filejump",
+                $"address-bar fallback aborted: focus not on address edit hwnd=0x{dialogHwnd.ToInt64():X}");
+            return false;
+        }
+
+        // 优先 WM_SETTEXT 静默填充：逐字键入（SendUnicodeString）会触发地址栏自动完成
+        // 下拉列表弹出（微信等宿主表现明显），消息填充则无任何可见的键入过程。
+        if (TryFillFocusedAddressEditViaMessage(dialogTid, norm))
+        {
+            Thread.Sleep(40);
+            SendEnter();
+            return true;
+        }
+
         if (TrySetFocusedAddressValue(norm))
         {
             Thread.Sleep(40);
@@ -1397,6 +1469,69 @@ internal static class FileDialogJumpHelper
         Thread.Sleep(30);
         SendEnter();
         return true;
+    }
+
+    /// <summary>焦点在真实 Win32 Edit 上时直接 WM_SETTEXT 填入路径并回读校验，全程无键入、无下拉。</summary>
+    private static bool TryFillFocusedAddressEditViaMessage(uint dialogTid, string path)
+    {
+        try
+        {
+            var gti = new Win32.GUITHREADINFO();
+            gti.cbSize = Marshal.SizeOf<Win32.GUITHREADINFO>();
+            if (!Win32.GetGUIThreadInfo(dialogTid, ref gti) || gti.hwndFocus == IntPtr.Zero)
+                return false;
+
+            var focus = gti.hwndFocus;
+            if (!Win32.GetWindowClassName(focus).Equals("Edit", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            Win32.SendMessage(focus, Win32.WM_SETTEXT, IntPtr.Zero, path);
+
+            var sb = new StringBuilder(1024);
+            Win32.SendMessage(focus, Win32.WM_GETTEXT, (IntPtr)sb.Capacity, sb);
+            return string.Equals(sb.ToString(), path, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 判断对话框线程当前焦点是否位于可安全输入路径的地址栏：
+    /// 焦点控件须属于该对话框、类名为可编辑控件（Edit/ComboBox/DirectUI 面包屑），
+    /// 且位于对话框上半部——文件名输入框在底部，文件列表 DirectUI 在中部，
+    /// 两者盲打 Enter 都会误触「打开/保存」。
+    /// </summary>
+    private static bool IsFocusSuitableForAddressTyping(IntPtr dialogHwnd, uint dialogTid)
+    {
+        try
+        {
+            var gti = new Win32.GUITHREADINFO();
+            gti.cbSize = Marshal.SizeOf<Win32.GUITHREADINFO>();
+            if (!Win32.GetGUIThreadInfo(dialogTid, ref gti) || gti.hwndFocus == IntPtr.Zero)
+                return false;
+
+            var focus = gti.hwndFocus;
+            if (Win32.GetAncestor(focus, Win32.GA_ROOT) != dialogHwnd)
+                return false;
+
+            var cls = Win32.GetWindowClassName(focus);
+            var editable = cls.Contains("Edit", StringComparison.OrdinalIgnoreCase)
+                || cls.Contains("ComboBox", StringComparison.OrdinalIgnoreCase)
+                || cls.Contains("DirectUIHWND", StringComparison.Ordinal);
+            if (!editable)
+                return false;
+
+            if (!Win32.GetWindowRect(focus, out var fr) || !Win32.GetWindowRect(dialogHwnd, out var dr))
+                return false;
+            var dlgHeight = dr.Bottom - dr.Top;
+            return dlgHeight > 0 && fr.Top - dr.Top < dlgHeight * 0.55;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static bool TrySetFocusedAddressValue(string path)

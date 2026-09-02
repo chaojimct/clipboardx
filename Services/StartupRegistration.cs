@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Security;
 using System.Text;
 using Microsoft.Win32;
 
@@ -18,8 +19,17 @@ public static class StartupRegistration
     private const string LegacyValueName = "ClipboardManager";
     private const string ValueName = "ClipboardX";
 
-    /// <summary>任务计划程序中用于管理员自启的任务名。</summary>
-    private const string ScheduledTaskName = "ClipboardX_AutoStart";
+    /// <summary>
+    /// 任务计划程序中用于管理员自启的任务名。
+    /// DEBUG 构建加 _Dev 后缀：开发版与正式安装版各自独立注册自启任务，
+    /// 避免 /F 强制覆盖把正式版的开机任务改指向开发版 exe。
+    /// </summary>
+    private const string ScheduledTaskName =
+#if DEBUG
+        "ClipboardX_AutoStart_Dev";
+#else
+        "ClipboardX_AutoStart";
+#endif
 
     /// <summary>
     /// 解析要写入 Run 键 / 任务计划程序的可执行路径；<c>dotnet run</c> 等场景返回 null，避免误注册 dotnet.exe。
@@ -143,33 +153,78 @@ public static class StartupRegistration
     }
 
     /// <summary>
-    /// 通过 schtasks /Create 注册一个“登录时触发、以最高权限运行”的任务。
+    /// 通过 schtasks /Create /XML 注册一个“登录时触发、以最高权限运行”的任务。
     /// 比 HKCU Run + PowerShell RunAs 更可靠：登录会话阶段 UAC 无法稳定显示同意弹窗，
     /// RunAs 方案会被静默拦截；任务计划程序的 HighestLevel 自带提权、不弹 UAC。
     /// </summary>
+    /// <remarks>
+    /// 不用 <c>/TR "\"exe路径\""</c> 方式：schtasks 会把引号原样写进任务的 Command 字段，
+    /// 任务计划程序运行带引号的 Command 时改由 cmd.exe 解释执行，登录时会闪现 conhost
+    /// 控制台窗口。改用标准 XML（Command 为不带引号的纯路径）导入注册，行为可控。
+    /// </remarks>
     private static void RegisterScheduledTaskForElevatedStartup(string exePath)
     {
-        // /RU "%USERNAME%" 指定当前用户，/RL HIGHEST 请求最高权限，/SC ONLOGON 登录时触发
-        // /F 强制覆盖已存在的同名任务（用于重新启用）
-        var args = new StringBuilder()
-            .Append("/Create /F ")
-            .Append("/TN \"").Append(ScheduledTaskName).Append("\" ")
-            .Append("/TR \"\\\"").Append(exePath).Append("\\\"\" ")
-            .Append("/SC ONLOGON ")
-            .Append("/RL HIGHEST ")
-            .Append("/RU \"").Append(Environment.UserDomainName).Append("\\").Append(Environment.UserName).Append("\"");
+        var xmlPath = Path.Combine(Path.GetTempPath(), $"clipboardx_task_{Guid.NewGuid():N}.xml");
+        try
+        {
+            File.WriteAllText(xmlPath, BuildTaskXml(exePath), Encoding.Unicode);
+            if (RunSchtasks($"/Create /F /TN \"{ScheduledTaskName}\" /XML \"{xmlPath}\"", out _) == 0)
+                return;
+        }
+        catch
+        {
+            // 落盘失败则尝试回退方案
+        }
+        finally
+        {
+            try { File.Delete(xmlPath); } catch { /* ignore */ }
+        }
 
-        if (RunSchtasks(args.ToString(), out var _) == 0) return;
+        // 回退：带引号 /TR（与 v1.9.7 相同——路径含空格也能启动，仅登录时闪一次控制台）。
+        // 不能用不带引号的 /TR：空格路径会被任务计划程序拆断，注册出完全无法启动的任务。
+        RunSchtasks(
+            $"/Create /F /TN \"{ScheduledTaskName}\" /TR \"\\\"{exePath}\\\"\" /SC ONLOGON /RL HIGHEST",
+            out _);
+    }
 
-        // 回退：不指定 /RU，由 schtasks 使用当前调用方用户
-        var argsFallback = new StringBuilder()
-            .Append("/Create /F ")
-            .Append("/TN \"").Append(ScheduledTaskName).Append("\" ")
-            .Append("/TR \"\\\"").Append(exePath).Append("\\\"\" ")
-            .Append("/SC ONLOGON ")
-            .Append("/RL HIGHEST");
+    /// <summary>生成最高权限登录自启任务的标准 XML（Command 不带引号，电池模式允许启动，无执行时限）。</summary>
+    private static string BuildTaskXml(string exePath)
+    {
+        var user = $"{Environment.UserDomainName}\\{Environment.UserName}";
+        var escapedPath = SecurityElement.Escape(exePath);
+        var escapedUser = SecurityElement.Escape(user);
 
-        RunSchtasks(argsFallback.ToString(), out _);
+        return $@"<?xml version=""1.0"" encoding=""UTF-16""?>
+<Task version=""1.2"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
+  <RegistrationInfo>
+    <Description>ClipboardX logon auto start (elevated)</Description>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id=""Author"">
+      <UserId>{escapedUser}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <DisallowDemandStart>false</DisallowDemandStart>
+  </Settings>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{escapedUser}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Actions Context=""Author"">
+    <Exec>
+      <Command>{escapedPath}</Command>
+    </Exec>
+  </Actions>
+</Task>";
     }
 
     private static void RemoveScheduledTask()

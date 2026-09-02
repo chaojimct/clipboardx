@@ -1,6 +1,7 @@
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace ClipboardManager;
 
@@ -27,6 +28,9 @@ internal static class ShellDialogDeepNavigate
 
     /// <summary>路径 WCHAR[520]，与 native NavigatePayload.path 一致。</summary>
     private const int MaxPathChars = 520;
+
+    private const uint ExitCodeBusy = 0x800700AA;
+    private const uint ExitCodeEFail = 0x80004005;
 
     public static bool TryBrowseObjectInject(IntPtr dialogHwnd, string folderPath)
     {
@@ -126,28 +130,10 @@ internal static class ShellDialogDeepNavigate
                     return false;
                 }
 
-                var t = CreateRemoteThread(hProcess, IntPtr.Zero, 0, remoteFn, pPayload, 0, IntPtr.Zero);
-                if (t == IntPtr.Zero)
-                {
-                    ShellNavigateLog.WriteInjectorWin32("CreateRemoteThread failed", Marshal.GetLastWin32Error());
-                    return false;
-                }
-                try
-                {
-                    WaitForSingleObject(t, 15000);
-                    GetExitCodeThread(t, out var code);
-                    if (code == 0)
-                    {
-                        ShellNavigateLog.WriteInjector("remote thread OK (see native lines in same log file)");
-                        return true;
-                    }
-                    ShellNavigateLog.WriteInjector($"remote thread exit code={code} (0x{code:X})");
-                    return false;
-                }
-                finally
-                {
-                    CloseHandle(t);
-                }
+                var ok = InvokeRemoteNavigateWithRetry(hProcess, remoteFn, pPayload);
+                if (ok)
+                    ShellNavigateLog.WriteInjector("remote thread OK (see native lines in same log file)");
+                return ok;
             }
             finally
             {
@@ -158,6 +144,51 @@ internal static class ShellDialogDeepNavigate
         {
             CloseHandle(hProcess);
         }
+    }
+
+    /// <summary>
+    /// 注入式导航的 busy/E_FAIL 重试：native 侧每次只做单次 BrowseObject（不能在宿主
+    /// UI 线程上 Sleep），视图未就绪时由本方法在调用方后台线程退避后重新拉起远程线程。
+    /// 远程线程等待超时说明宿主 UI 线程未泵消息（可能卡死），此时直接放弃注入。
+    /// </summary>
+    private static bool InvokeRemoteNavigateWithRetry(IntPtr hProcess, IntPtr remoteFn, IntPtr pPayload)
+    {
+        uint[] retryDelaysMs = { 0, 150, 300, 500, 800, 1200 };
+
+        for (var attempt = 0; attempt < retryDelaysMs.Length; attempt++)
+        {
+            if (retryDelaysMs[attempt] > 0)
+                Thread.Sleep((int)retryDelaysMs[attempt]);
+
+            var t = CreateRemoteThread(hProcess, IntPtr.Zero, 0, remoteFn, pPayload, 0, IntPtr.Zero);
+            if (t == IntPtr.Zero)
+            {
+                ShellNavigateLog.WriteInjectorWin32("CreateRemoteThread failed", Marshal.GetLastWin32Error());
+                return false;
+            }
+            try
+            {
+                var wr = WaitForSingleObject(t, 8000);
+                if (wr != 0)
+                {
+                    ShellNavigateLog.WriteInjector(
+                        $"remote navigate wait not signaled (0x{wr:X}); host UI thread likely stuck, giving up");
+                    return false;
+                }
+                GetExitCodeThread(t, out var code);
+                if (code == 0)
+                    return true;
+
+                ShellNavigateLog.WriteInjector($"remote navigate attempt {attempt} exit code={code} (0x{code:X})");
+                var retryable = code == ExitCodeBusy || code == ExitCodeEFail;
+                if (!retryable) return false;
+            }
+            finally
+            {
+                CloseHandle(t);
+            }
+        }
+        return false;
     }
 
     /// <summary>

@@ -274,6 +274,8 @@ public partial class PopupWindow : Window
     /// <summary>最近一次离开外部文件管理器时记录到的路径；用于切回文件对话框时优先同步。</summary>
     private string _lastExternalFolder = "";
     private IntPtr _lastExternalManagerRoot = IntPtr.Zero;
+    /// <summary>外部管理器路径异步采集的世代号：仅最新一次请求的结果可写入，防止 prev/hwnd 乱序覆盖。</summary>
+    private int _externalFolderRememberGen;
     /// <summary>Picker 打开时轮询 Explorer 窗口路径变化的定时器。</summary>
     private System.Windows.Threading.DispatcherTimer? _explorerPathPollTimer;
     private string _explorerPathPollLastPath = "";
@@ -3837,22 +3839,46 @@ public partial class PopupWindow : Window
         // 跳过需要通过剪贴板通信的文件管理器（XYplorer、Total Commander），
         // 避免每次前台切换都发送脚本导致 scripting console 异常和剪贴板被覆盖。
         // 这些管理器的路径仅在文件对话框打开时按需采集（CollectCandidates）。
-        var rootCls = Win32.GetWindowClassName(Win32.GetAncestor(hwnd, Win32.GA_ROOT));
-        if (rootCls is "ThunderRT6FormDC" or "TTOTAL_CMD") return;
-
-        var folder = FileManagerPathCollector.TryGetFolderForWindow(hwnd);
-        if (string.IsNullOrWhiteSpace(folder)) return;
-
         var root = Win32.GetAncestor(hwnd, Win32.GA_ROOT);
+        var rootCls = Win32.GetWindowClassName(root);
+        if (rootCls is "ThunderRT6FormDC" or "TTOTAL_CMD") return;
         if (root == IntPtr.Zero) root = hwnd;
-        var normalized = folder.Trim();
-        if (string.Equals(_lastExternalFolder, normalized, StringComparison.OrdinalIgnoreCase)
-            && _lastExternalManagerRoot == root)
-            return;
 
-        _lastExternalFolder = normalized;
-        _lastExternalManagerRoot = root;
-        ShellNavigateLog.Write("filejump", $"external folder updated root=0x{root.ToInt64():X} path=\"{normalized}\"");
+        // Explorer COM 枚举 + UIA 回退可达数百毫秒甚至更久；此前在 UI 线程同步执行，
+        // 前台切到/切出资源管理器时会整段卡住界面。移到后台线程采集，结果回 UI 线程比对写入。
+        unchecked { _externalFolderRememberGen++; }
+        var gen = _externalFolderRememberGen;
+        var capturedHwnd = hwnd;
+        var capturedRoot = root;
+        var th = new Thread(() =>
+        {
+            string? folder;
+            try
+            {
+                folder = FileManagerPathCollector.TryGetFolderForWindow(capturedHwnd);
+            }
+            catch
+            {
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(folder)) return;
+            var normalized = folder.Trim();
+
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (gen != _externalFolderRememberGen) return;
+                if (string.Equals(_lastExternalFolder, normalized, StringComparison.OrdinalIgnoreCase)
+                    && _lastExternalManagerRoot == capturedRoot)
+                    return;
+
+                _lastExternalFolder = normalized;
+                _lastExternalManagerRoot = capturedRoot;
+                ShellNavigateLog.Write("filejump",
+                    $"external folder updated root=0x{capturedRoot.ToInt64():X} path=\"{normalized}\"");
+            }, DispatcherPriority.Background);
+        }) { IsBackground = true, Name = "ClipboardX-RememberExternalFolder" };
+        th.SetApartmentState(ApartmentState.STA);
+        th.Start();
     }
 
     private void TryJumpFileDialogToLastFolder()
@@ -4065,15 +4091,16 @@ public partial class PopupWindow : Window
     }
 
     /// <summary>在后台 STA 线程执行文件对话框导航，避免 Thread.Sleep 阻塞 UI 线程。</summary>
+    /// <param name="allowKeyboardFallback">自动同步等无人值守场景传 false：仅注入导航，禁止模拟输入。</param>
     private void NavigateToFolderInBackground(IntPtr dialogHwnd, string path, bool allowShellInject,
-        Action<bool>? onCompleted = null)
+        bool allowKeyboardFallback = true, Action<bool>? onCompleted = null)
     {
         MarkFileJumpNavigationSuppressed(dialogHwnd, path);
         var th = new Thread(() =>
         {
             try
             {
-                var ok = FileDialogJumpHelper.TryNavigateToFolder(dialogHwnd, path, allowShellInject);
+                var ok = FileDialogJumpHelper.TryNavigateToFolder(dialogHwnd, path, allowShellInject, allowKeyboardFallback);
                 onCompleted?.Invoke(ok);
             }
             catch (Exception ex)
@@ -4531,7 +4558,8 @@ public partial class PopupWindow : Window
         var autoNavigate = _appSettings.FileJumpAutoOnFirstClick;
         if (autoNavigate)
         {
-            NavigateToFolderInBackground(dialogHwnd, candidates[prefer].Path, allowShellInject);
+            NavigateToFolderInBackground(dialogHwnd, candidates[prefer].Path, allowShellInject,
+                allowKeyboardFallback: false);
             _fileJumpAutoFirstJumpDoneRoot = dialogRootNow;
             DisarmFileJumpClickToNavigate();
         }
@@ -4601,7 +4629,8 @@ public partial class PopupWindow : Window
                 var prefer = PreferCandidateIndex(dialogHwndCapture, candidates);
                 var capturedRoot = rootNow;
                 NavigateToFolderInBackground(dialogHwndCapture, candidates[prefer].Path, allowShellInject,
-                    ok =>
+                    allowKeyboardFallback: false,
+                    onCompleted: ok =>
                     {
                         if (ok)
                         {
@@ -4706,32 +4735,39 @@ public partial class PopupWindow : Window
         if (!IsForegroundFocusOnFileDialogRoot(dialogRoot)) return;
 
         var allowShellInject = _appSettings.EnableShellNavigateInject;
-        var preferLastExternal = ShouldPreferLastExternalFolderForAutoSync(previousForegroundHwnd);
+        var memFallback = _appSettings.LastFileDialogFolder?.Trim();
 
-        // 直接读取前一个窗口的最新路径，而非使用可能过时的 _lastExternalFolder
-        var preferredExternalFolder = "";
-        if (preferLastExternal && previousForegroundHwnd != IntPtr.Zero)
-        {
-            var directPath = FileManagerPathCollector.TryGetFolderForWindow(previousForegroundHwnd, fresh: true);
-            if (!string.IsNullOrEmpty(directPath) && Directory.Exists(directPath))
-                preferredExternalFolder = directPath.Trim();
-            else if (!string.IsNullOrEmpty(_lastExternalFolder))
-                preferredExternalFolder = _lastExternalFolder.Trim();
-        }
-
-        var mem = !string.IsNullOrEmpty(preferredExternalFolder)
-            ? preferredExternalFolder
-            : _appSettings.LastFileDialogFolder?.Trim();
-
+        // 直接读取前一个窗口的最新路径，而非使用可能过时的 _lastExternalFolder。
+        // fresh 读取是未缓存 COM 枚举 + UIA 回退，可达数百毫秒；移入后台 STA 采集线程执行，避免切回对话框时卡 UI。
         var recentCapture = CopyRecentForJump(_appSettings);
 
         unchecked { _fileJumpAutoSyncCollectGen++; }
         var gen = _fileJumpAutoSyncCollectGen;
         var dialogCapture = dialogHwnd;
         var dialogRootCapture = dialogRoot;
+        var prevCapture = previousForegroundHwnd;
 
         void StaCollect()
         {
+            var preferLastExternal = ShouldPreferLastExternalFolderForAutoSync(prevCapture);
+            var preferredExternalFolder = "";
+            if (preferLastExternal && prevCapture != IntPtr.Zero)
+            {
+                try
+                {
+                    var directPath = FileManagerPathCollector.TryGetFolderForWindow(prevCapture, fresh: true);
+                    if (!string.IsNullOrEmpty(directPath) && Directory.Exists(directPath))
+                        preferredExternalFolder = directPath.Trim();
+                    else if (!string.IsNullOrEmpty(_lastExternalFolder))
+                        preferredExternalFolder = _lastExternalFolder.Trim();
+                }
+                catch { /* ignore */ }
+            }
+
+            var mem = !string.IsNullOrEmpty(preferredExternalFolder)
+                ? preferredExternalFolder
+                : memFallback;
+
             List<FileJumpCandidate> candidates;
             try
             {
@@ -4782,7 +4818,10 @@ public partial class PopupWindow : Window
                             return;
                         ShellNavigateLog.Write("filejump",
                             $"auto-sync navigating from \"{currentFolder ?? "(unreadable)"}\" to \"{capturedPreferred}\"");
-                        NavigateToFolderInBackground(capturedDialog, capturedPreferred, capturedAllowInject);
+                        // 自动同步是无人值守操作：仅注入导航。模拟输入（Ctrl+L/Enter）在焦点
+                        // 不在地址栏时会误触「打开/保存」，直接关掉用户正在操作的对话框。
+                        NavigateToFolderInBackground(capturedDialog, capturedPreferred, capturedAllowInject,
+                            allowKeyboardFallback: false);
                     }, DispatcherPriority.Normal);
                 }) { IsBackground = true, Name = "ClipboardX-AutoSyncRead" };
                 thRead.Start();
@@ -4823,7 +4862,7 @@ public partial class PopupWindow : Window
         if (_activeFileJumpPicker == null) return false;
         if (!ActivePickerMatchesDialog(dialogRoot)) return false;
         if (!_activeFileJumpPicker.IsAutoForegroundStickyMode) return false;
-        _activeFileJumpPicker.NavigateKeepOpenToPath(preferredPath);
+        _activeFileJumpPicker.NavigateKeepOpenToPath(preferredPath, allowKeyboardFallback: false);
         return true;
     }
 
@@ -5197,8 +5236,11 @@ public partial class PopupWindow : Window
 
             var doneRoot = Win32.GetAncestor(dlg, Win32.GA_ROOT);
             DisarmFileJumpClickToNavigate();
+            // 点击后自动跳转是无人值守操作（用户点击多为选中文件）：仅注入导航，
+            // 模拟输入的 Enter 会直接确认/关闭用户正在操作的对话框。
             NavigateToFolderInBackground(dlg, candidates[0].Path, _appSettings.EnableShellNavigateInject,
-                ok =>
+                allowKeyboardFallback: false,
+                onCompleted: ok =>
                 {
                     if (ok && doneRoot != IntPtr.Zero)
                         _fileJumpAutoFirstJumpDoneRoot = doneRoot;

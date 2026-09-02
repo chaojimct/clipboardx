@@ -1951,12 +1951,13 @@ public partial class FileDialogJumpPickerWindow : Window
     /// <summary>
     /// 粘性模式下由外部触发：保持窗口打开，直接导航到目标路径并在完成后刷新列表。
     /// </summary>
-    public void NavigateKeepOpenToPath(string path)
+    /// <param name="allowKeyboardFallback">自动同步等无人值守触发传 false：仅注入导航，禁止模拟输入。</param>
+    public void NavigateKeepOpenToPath(string path, bool allowKeyboardFallback = true)
     {
         if (!_autoForegroundStickyMode) return;
         if (string.IsNullOrWhiteSpace(path)) return;
         SelectedPath = path;
-        CommitNavigateKeepOpen(path);
+        CommitNavigateKeepOpen(path, allowKeyboardFallback);
     }
 
     private void CommitAndClose(string path)
@@ -1966,7 +1967,7 @@ public partial class FileDialogJumpPickerWindow : Window
     }
 
     /// <summary>粘性自动模式：只切换文件对话框目录并刷新列表，不关闭窗口。</summary>
-    private void CommitNavigateKeepOpen(string path)
+    private void CommitNavigateKeepOpen(string path, bool allowKeyboardFallback = true)
     {
         var normalizedPath = NormalizeCommitNavigatePath(path);
         if (!string.IsNullOrEmpty(normalizedPath)
@@ -2009,7 +2010,7 @@ public partial class FileDialogJumpPickerWindow : Window
         {
             try
             {
-                if (!FileDialogJumpHelper.TryNavigateToFolder(dlgHwnd, path, allowInject))
+                if (!FileDialogJumpHelper.TryNavigateToFolder(dlgHwnd, path, allowInject, allowKeyboardFallback))
                     return;
 
                 string? folderAfter = null;
