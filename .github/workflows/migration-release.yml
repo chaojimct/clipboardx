@@ -109,10 +109,12 @@ jobs:
           foreach ($z in Get-ChildItem 'ClipboardX-*.zip') {
             $zip = [System.IO.Compression.ZipFile]::OpenRead($z.FullName)
             try {
-              $names = $zip.Entries | ForEach-Object { $_.FullName }
+              # 用 @() 强制数组：单条时管道会让 $names 退化成字符串，
+              # 此时 $names[0] 取的是首字符而非首个条目，判定会误报。
+              $names = @($zip.Entries | ForEach-Object { $_.FullName })
               Write-Host "$($z.Name) -> $($names -join ', ')"
               if ($names.Count -ne 1 -or $names[0] -ne 'ClipboardX.exe') {
-                throw "$($z.Name) 内应只有根目录 ClipboardX.exe"
+                throw "$($z.Name) 内应只有根目录 ClipboardX.exe，实际 $($names.Count) 项：[$(($names -join ', '))]"
               }
             } finally { $zip.Dispose() }
           }
