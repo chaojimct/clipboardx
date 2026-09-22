@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ClipboardX → clipx 迁移版 launcher。
+
+    存在意义：老版更新通道只能把用户带到「同一个仓库的新版本」。要让它成为
+    迁移通道，就在老仓库发一个 tag 大于 v1.9.9 的版本，把该版本的可执行文件
+    换成这个 launcher —— 老用户点「检查更新 → 安装」，重启后落到的就是我们
+    的迁移向导，而不是老界面。
+
+    硬约束（不满足会被老更新器拒绝，详见 docs/MIGRATION.md）：
+      · 本 launcher 产物必须命名为 ClipboardX.exe（老更新器按当前 exe 名选包 +
+        安装后 Start-Process <installDir>\<当前 exe 名>）；
+      · 老仓库 release 必须同时提供 self-contained 与 no-runtime 两个 zip 变体。
+
+    本文件刻意不引 WPF/WinForms：迁移向导是控制台式交互窗口，不需要 XAML。
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>ClipboardX.Migrator</RootNamespace>
+    <AssemblyName>ClipboardX</AssemblyName>
+    <Version>1.9.10</Version>
+    <Product>ClipboardX 迁移向导</Product>
+    <Company>ClipboardX</Company>
+    <RepositoryUrl>https://github.com/chaojimct/clipboardx</RepositoryUrl>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+  </PropertyGroup>
+
+</Project>
