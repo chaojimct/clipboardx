@@ -1,0 +1,196 @@
+name: Migration Release (v1.9.10+)
+
+# 专用于「迁移版」发版：把老用户顺更新通道带到 clipx。
+#
+# 与常规 release.yml 的区别：
+#   · 产物不是老 WPF 程序，而是 Migrator（迁移向导 launcher）；
+#   · 只为「已经装了老版」的用户服务，因此包内只有一个 ClipboardX.exe。
+#
+# 老更新器硬约束（Services/GitHubUpdateService.cs，不满足会被拒绝）：
+#   1) 资产名 = {主程序名}-{版本}-win-x64-{self-contained,no-runtime}.zip
+#      · 主程序名 ClipboardX 时排除 -clipboard- / -filejump- 前缀；
+#      · 两个运行形态变体都要有（升级选包按当前运行形态定优先级）。
+#   2) zip 内根目录必须有 ClipboardX.exe。
+#   3) tag 版本必须 > 当前版本（Version.TryParse 比较）。
+#
+# 触发方式：推送 v1.9.10 及以上的 tag（或在 Actions 里手动 dispatch）。
+# 注意：常规 release.yml 已被限制为只响应 ≤ v1.9.9，两者不会撞车。
+
+on:
+  push:
+    tags:
+      - 'v1.9.[0-9][0-9]'      # v1.9.10 ~ v1.9.99
+      - 'v1.[2-9][0-9].*'      # v1.20.x 及以上
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不含 v 前缀），例如 1.9.10'
+        required: true
+        default: '1.9.10'
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 两个运行形态：FDD（需预装 .NET 8 桌面运行时）与 SC（自带运行时）。
+      # 勿对 FDD 用 EnableCompressionInSingleFile（NETSDK1176：仅独立应用支持）。
+      - name: Publish — 不含运行时（单文件）
+        shell: pwsh
+        run: |
+          dotnet publish Migrator\Migrator.csproj -c Release -r win-x64 `
+            -p:SelfContained=false `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:IncludeAllContentForSelfExtract=true `
+            -p:DebugType=None `
+            -p:Version=${{ steps.ver.outputs.version }} `
+            -o publish/migrator-fdd
+          if ($LASTEXITCODE -ne 0) { throw "publish (fdd) 失败" }
+
+      - name: Publish — 自带运行时（单文件）
+        shell: pwsh
+        run: |
+          dotnet publish Migrator\Migrator.csproj -c Release -r win-x64 `
+            -p:SelfContained=true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:IncludeAllContentForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            -p:Version=${{ steps.ver.outputs.version }} `
+            -o publish/migrator-sc
+          if ($LASTEXITCODE -ne 0) { throw "publish (sc) 失败" }
+
+      - name: 校验产物只有一个 ClipboardX.exe
+        shell: pwsh
+        run: |
+          foreach ($dir in @('publish/migrator-fdd', 'publish/migrator-sc')) {
+            $files = Get-ChildItem $dir -File
+            Write-Host "$dir -> $($files.Name -join ', ')"
+            if ($files.Count -ne 1) { throw "$dir 应只有一个文件，实际 $($files.Count) 个" }
+            if ($files[0].Name -ne 'ClipboardX.exe') { throw "$dir 根 exe 名必须是 ClipboardX.exe" }
+          }
+
+      - name: 打包（资产名按老更新器规则）
+        shell: pwsh
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          Compress-Archive -Path 'publish/migrator-fdd/*' -DestinationPath "ClipboardX-$v-win-x64-no-runtime.zip" -Force
+          Compress-Archive -Path 'publish/migrator-sc/*'  -DestinationPath "ClipboardX-$v-win-x64-self-contained.zip" -Force
+          Get-ChildItem 'ClipboardX-*.zip' | ForEach-Object {
+            Write-Host ("{0}  {1} MB" -f $_.Name, [math]::Round($_.Length / 1MB, 2))
+          }
+
+      - name: 从 zip 内二次校验（防止 Compress-Archive 带目录前缀）
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          foreach ($z in Get-ChildItem 'ClipboardX-*.zip') {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($z.FullName)
+            try {
+              $names = $zip.Entries | ForEach-Object { $_.FullName }
+              Write-Host "$($z.Name) -> $($names -join ', ')"
+              if ($names.Count -ne 1 -or $names[0] -ne 'ClipboardX.exe') {
+                throw "$($z.Name) 内应只有根目录 ClipboardX.exe"
+              }
+            } finally { $zip.Dispose() }
+          }
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: migrator-artifacts
+          path: ClipboardX-*.zip
+
+  create-release:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 组装 Release 正文
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          awk -v v="$VERSION" '
+            BEGIN { insection=0 }
+            /^## \[/ {
+              if ($0 ~ "^## \\[" v "\\]") { insection=1; next }
+              if (insection) { exit }
+            }
+            insection { print }
+          ' CHANGELOG.md > changelog_section.md
+          if [ ! -s changelog_section.md ]; then
+            echo "::error::CHANGELOG.md 中未找到 ## [$VERSION] 章节，请补全后再打 tag"
+            exit 1
+          fi
+          {
+            echo "## 更新内容"
+            echo ""
+            cat changelog_section.md
+            echo ""
+            echo "---"
+            echo ""
+            echo "> **这是迁移版**：安装后启动的是「迁移向导」，会引导你把老版 ClipboardX 迁到新程序 **clipx**。"
+            echo "> 老版的历史与设置都会保留，向导不会删除任何数据。"
+            echo ""
+            echo "## 发布包说明"
+            echo ""
+            echo "| 包名 | 说明 |"
+            echo "|------|------|"
+            echo "| \`*-no-runtime.zip\` | 需预装 .NET 8 **桌面**运行时（x64） |"
+            echo "| \`*-self-contained.zip\` | 自带运行时，解压即用 |"
+            echo ""
+            echo "迁移后的新程序见 [clipx](https://github.com/chaojimct/clipx)。"
+          } > release_body.md
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_body.md
+          generate_release_notes: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

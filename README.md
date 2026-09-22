@@ -2,6 +2,16 @@
 
 **[下载最新版 (Releases)](https://github.com/chaojimct/clipboardx/releases)** · [官网](https://chaojimct.github.io/clipboardx/) · [源码](https://github.com/chaojimct/clipboardx) · [功能介绍与同类对比](docs/ClipboardX-Introduction.md)
 
+> ### ⚠️ 本版已进入「迁移版」状态，请迁往 clipx
+>
+> 从 **v1.9.10** 起，本程序发布的不再是剪贴板工具本体，而是一个**迁移向导**：安装后启动会引导你迁移到新一代重写版本 **[clipx](https://github.com/chaojimct/clipx)**——交互一脉相承，常驻内存更低、启动更快，并补齐原生 OCR、批量 FIFO/LIFO 等能力。
+>
+> - 向导会自动安装 clipx，并**自动导入你的老版历史与 OCR 结果**；你不需要手动导出任何东西。
+> - 向导**不会删除**老版的程序与数据（历史库在 `%LocalAppData%\ClipboardX`）。确认数据无误后若想卸载老版，**卸载时请选「否」保留历史**。
+> - 正在用的老版本可以直接用托盘 **「检查更新…」** 升到 v1.9.10，走完后即完成迁移。
+>
+> 新版下载与说明见 **[chaojimct/clipx](https://github.com/chaojimct/clipx)**。
+
 轻量级 Windows **剪贴板历史 + 文件对话框跳转**二合一工具：剪贴板弹窗**不抢焦点**（`WS_EX_NOACTIVATE`），并支持在「打开 / 保存」等窗口中一键跳转到资源管理器或常用目录（默认 **Ctrl+G**）。
 
 ## 演示

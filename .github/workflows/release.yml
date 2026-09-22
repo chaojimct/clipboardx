@@ -1,9 +1,16 @@
 name: Release
 
+# ⚠️ 本工作流只负责 v1.9.9 及更早的「常规版」发布。
+# 从 v1.9.10 起，本仓库发布的是「迁移版」launcher（产物是 Migrator，不是老 WPF 程序），
+# 由 migration-release.yml 负责。两个工作流不能同时响应同一 tag，
+# 否则会各自建 release 相互覆盖 —— 因此这里必须**显式排除** 1.9.10 及以上。
+
 on:
   push:
     tags:
-      - 'v*'
+      # 只匹配 1.0.0 ~ 1.9.9（历史常规版）；1.9.10+ 交给 migration-release.yml。
+      - 'v1.[0-8].*'
+      - 'v1.9.[0-9]'
 
 jobs:
   release:
