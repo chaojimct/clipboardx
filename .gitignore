@@ -21,3 +21,6 @@ ClipboardX/
 # Debug files
 debug-*.log
 *.patch
+
+# 工具宿主的临时工作目录（演练脚本、截图、提交信息草稿等），不入库
+.workbuddy/
