@@ -49,7 +49,8 @@ ClipboardX.exe --migrate
 # 以「迁移中」形态打开向导（进度条 + 日志可见），供无人值守截图核对排版
 ClipboardX.exe --demo-busy
 
-# 按 150% 缩放模拟排版 —— 在 100% 的开发机上重现高分屏效果（v1.9.10 事故的根因就是这个没测）
+# 按 150% 缩放模拟排版 —— 在任意 DPI 的开发机上重现高分屏效果
+# （v1.9.10 事故的根因就是没人拍过 150%：开发机是 200% 主屏 + 100% 副屏）
 ClipboardX.exe --demo-scale 150
 ```
 
@@ -58,8 +59,9 @@ ClipboardX.exe --demo-scale 150
 ```
 === ClipboardX 迁移版 launcher 现状 ===
 launcher 版本      : 1.9.11
-主屏 DPI           : 144（150%）
-主屏工作区         : 1707x1115（逻辑像素）
+显示器（各屏实测 DPI，launcher 声明 PerMonitorV2，这里是真值）：
+  2880x1920 @(0,0)  DPI=192（200%）  主屏
+  1920x1080 @(2880,-1)  DPI=96（100%）
 自身目录（老版）   : C:\Users\<用户>\AppData\Local\Programs\ClipboardX
 老版数据目录       : C:\Users\<用户>\AppData\Local\ClipboardX（存在）
 老版是否在运行     : False
@@ -68,6 +70,9 @@ clipx 是否已安装   : True
 剩余 Run 值        : []
 剩余计划任务       : [ClipboardX_AutoStart, ClipboardX_AutoStart_Dev]
 ```
+
+> `--demo-scale` 的字号按「目标 DPI ÷ 当前显示器 DPI」折算，所以它在**任意**缩放的开发机上都准确，
+> 不会与开发机自身的 DPI 叠加。校准数据见 CHANGELOG 的 Unreleased 段。
 
 ## 已知边界
 

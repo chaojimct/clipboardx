@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace ClipboardX.Migrator;
@@ -22,6 +23,14 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // 必须先初始化 WinForms 运行时（含进程级 DPI 感知声明）。
+        //
+        // 放在所有分支之前：--check 是 headless 的、不建窗口，但它的 DPI 诊断要靠这个 ——
+        // 不初始化的话进程停留在默认感知级别，Graphics.FromHwnd(0) 会把真实 DPI
+        // 虚拟化成 96，高分屏用户报障时会给出「主屏 DPI 96（100%）」这种错误现场数据。
+        // （实测：同一台机器的向导窗口跑在 200% 的屏上，--check 却报 100%。）
+        ApplicationConfiguration.Initialize();
+
         var check = args.Any(a => a.Equals("--check", StringComparison.OrdinalIgnoreCase));
         var headless = args.Any(a =>
             a.Equals("--migrate", StringComparison.OrdinalIgnoreCase) ||
@@ -40,7 +49,6 @@ internal static class Program
             return RunHeadless();
         }
 
-        ApplicationConfiguration.Initialize();
         Application.Run(new WizardForm { DemoBusy = demoBusy, SimulatedScalePercent = demoScale });
         return 0;
     }
@@ -56,20 +64,60 @@ internal static class Program
         return 0;
     }
 
+    /// <summary>取某块显示器的有效 DPI（shcore 的 GetDpiForMonitor，MDT_EFFECTIVE_DPI）。</summary>
+    private static uint EffectiveDpi(IntPtr monitor)
+    {
+        try
+        {
+            if (GetDpiForMonitor(monitor, 0, out var dpiX, out _) == 0 && dpiX > 0) return dpiX;
+        }
+        catch (DllNotFoundException)
+        {
+            // Windows 8.1 之前没有 shcore，退回系统 DPI。
+        }
+        catch (EntryPointNotFoundException)
+        {
+        }
+        using var g = Graphics.FromHwnd(IntPtr.Zero);
+        return (uint)g.DpiX;
+    }
+
+    [DllImport("shcore.dll")]
+    private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    private const uint MONITOR_DEFAULTTONEAREST = 2;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+
     /// <summary>只读现状打印（不修改任何状态）。</summary>
     private static void PrintStatus()
     {
         Console.WriteLine("=== ClipboardX 迁移版 launcher 现状 ===");
         Console.WriteLine($"launcher 版本      : {MigratePaths.MigratorVersion}");
 
-        // 显示相关：高 DPI 下的显示问题全靠这几个数定位（launcher 声明 PerMonitorV2，
-        // 这里的 DPI 是真实值，不是被虚拟化成 96 的假象）。
-        using (var g = Graphics.FromHwnd(IntPtr.Zero))
+        // 显示相关：高 DPI 下的显示问题全靠这几个数定位。
+        // 逐显示器列出 —— 多屏不同缩放（例如笔记本 100% + 外接 200%）是这类问题的高发场景，
+        // 只报主屏不足以判断向导会落在哪块屏上、按哪个缩放排版。
+        Console.WriteLine("显示器（各屏实测 DPI，launcher 声明 PerMonitorV2，这里是真值）：");
+        foreach (var screen in Screen.AllScreens)
         {
-            Console.WriteLine($"主屏 DPI           : {g.DpiX}（{g.DpiX / 96.0 * 100:F0}%）");
+            var b = screen.Bounds;
+            var monitor = MonitorFromPoint(
+                new POINT { X = b.X + b.Width / 2, Y = b.Y + b.Height / 2 },
+                MONITOR_DEFAULTTONEAREST);
+            var dpi = EffectiveDpi(monitor);
+            Console.WriteLine(
+                $"  {b.Width}x{b.Height} @({b.X},{b.Y})  DPI={dpi}（{dpi / 96.0 * 100:F0}%）" +
+                (screen.Primary ? "  主屏" : ""));
         }
-        var area = Screen.PrimaryScreen?.WorkingArea ?? Rectangle.Empty;
-        Console.WriteLine($"主屏工作区         : {area.Width}x{area.Height}（逻辑像素）");
         Console.WriteLine($"自身目录（老版）   : {MigratePaths.SelfDir}");
         Console.WriteLine($"老版数据目录       : {MigratePaths.LegacyDataDir}" +
                           (Directory.Exists(MigratePaths.LegacyDataDir) ? "（存在）" : "（不存在）"));

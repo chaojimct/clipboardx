@@ -143,20 +143,29 @@ internal sealed class WizardForm : Form
     ///
     /// 正常运行时字号写 9pt / 15pt / 8.5pt 不动 —— point 是物理单位，渲染时系统自会
     /// 按显示器 DPI 放大，跟 <see cref="S"/> 的坐标缩放天然同比例。
-    /// 只有 <c>--demo-scale</c> 模拟时才把点值乘上倍数，好在 100% 屏上等价重现高分屏观感。
+    ///
+    /// <c>--demo-scale</c> 模拟时不能直接把点值乘上倍数：point 是物理单位，在非 100% 的
+    /// 开发机上会与真实 DPI **叠加**（本机屏是 200%，写 13.5pt 实际渲染出 3 倍大）。
+    /// 正确做法是按「目标 DPI / 真实 DPI」折算，这样无论开发机什么缩放，模拟结果都等价于
+    /// 目标 DPI 的观感。
     ///
     /// 带幂等守卫：ApplyLayout 会被多次调用（OnLoad/OnShown/SetBusy/DpiChanged），
     /// 每次都 new Font 会漏 GDI 句柄。
     /// </summary>
     private void ApplyFontsForScale()
     {
-        var f = SimulatedScalePercent > 0 ? SimulatedScalePercent / 100f : 1f;
-        if (!float.IsNaN(_appliedFontScale) && Math.Abs(f - _appliedFontScale) < 0.001f) return;
-        _appliedFontScale = f;
+        var realDpi = DeviceDpi > 0 ? DeviceDpi : BaseDpi;
+        var targetDpi = SimulatedScalePercent > 0
+            ? BaseDpi * SimulatedScalePercent / 100f
+            : realDpi;
+        var fontScale = targetDpi / realDpi;
 
-        var bodyFont = new Font("Microsoft YaHei UI", 9f * f);
-        var titleFont = new Font("Microsoft YaHei UI", 15f * f, FontStyle.Bold);
-        var logFont = new Font("Consolas", 8.5f * f);
+        if (!float.IsNaN(_appliedFontScale) && Math.Abs(fontScale - _appliedFontScale) < 0.001f) return;
+        _appliedFontScale = fontScale;
+
+        var bodyFont = new Font("Microsoft YaHei UI", 9f * fontScale);
+        var titleFont = new Font("Microsoft YaHei UI", 15f * fontScale, FontStyle.Bold);
+        var logFont = new Font("Consolas", 8.5f * fontScale);
         _ownedFonts.AddRange([bodyFont, titleFont, logFont]);
 
         Font = bodyFont;          // _body / _status / 按钮随继承
