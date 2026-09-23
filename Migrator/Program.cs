@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Drawing;
 using System.Windows.Forms;
 
 namespace ClipboardX.Migrator;
@@ -14,6 +15,7 @@ namespace ClipboardX.Migrator;
 ///   --migrate       不弹窗，直接跑完整迁移流程（无交互，供脚本演练）
 ///   --yes           与 --migrate 同义（兼容习惯写法）
 ///   --demo-busy     以「迁移中」形态打开向导（进度条 + 日志可见），供截图自检
+///   --demo-scale N  按 N% 的 DPI 缩放模拟排版（如 150），用于在 100% 屏上重现高分屏
 /// </summary>
 internal static class Program
 {
@@ -25,6 +27,7 @@ internal static class Program
             a.Equals("--migrate", StringComparison.OrdinalIgnoreCase) ||
             a.Equals("--yes", StringComparison.OrdinalIgnoreCase));
         var demoBusy = args.Any(a => a.Equals("--demo-busy", StringComparison.OrdinalIgnoreCase));
+        var demoScale = ReadDemoScale(args);
 
         if (check)
         {
@@ -38,7 +41,18 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new WizardForm { DemoBusy = demoBusy });
+        Application.Run(new WizardForm { DemoBusy = demoBusy, SimulatedScalePercent = demoScale });
+        return 0;
+    }
+
+    /// <summary>读 <c>--demo-scale N</c>；缺失或非法时返回 0（= 用真实显示器 DPI）。</summary>
+    private static int ReadDemoScale(string[] args)
+    {
+        for (var i = 0; i < args.Length - 1; i++)
+        {
+            if (!args[i].Equals("--demo-scale", StringComparison.OrdinalIgnoreCase)) continue;
+            if (int.TryParse(args[i + 1], out var pct) && pct is >= 100 and <= 400) return pct;
+        }
         return 0;
     }
 
@@ -47,6 +61,15 @@ internal static class Program
     {
         Console.WriteLine("=== ClipboardX 迁移版 launcher 现状 ===");
         Console.WriteLine($"launcher 版本      : {MigratePaths.MigratorVersion}");
+
+        // 显示相关：高 DPI 下的显示问题全靠这几个数定位（launcher 声明 PerMonitorV2，
+        // 这里的 DPI 是真实值，不是被虚拟化成 96 的假象）。
+        using (var g = Graphics.FromHwnd(IntPtr.Zero))
+        {
+            Console.WriteLine($"主屏 DPI           : {g.DpiX}（{g.DpiX / 96.0 * 100:F0}%）");
+        }
+        var area = Screen.PrimaryScreen?.WorkingArea ?? Rectangle.Empty;
+        Console.WriteLine($"主屏工作区         : {area.Width}x{area.Height}（逻辑像素）");
         Console.WriteLine($"自身目录（老版）   : {MigratePaths.SelfDir}");
         Console.WriteLine($"老版数据目录       : {MigratePaths.LegacyDataDir}" +
                           (Directory.Exists(MigratePaths.LegacyDataDir) ? "（存在）" : "（不存在）"));

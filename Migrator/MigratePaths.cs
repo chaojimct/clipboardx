@@ -63,6 +63,12 @@ internal static class MigratePaths
     /// <summary>clipx 安装来源仓库。</summary>
     public const string ClipxRepo = "chaojimct/clipx";
 
-    /// <summary>本迁移版自身的版本（显示用）。</summary>
-    public const string MigratorVersion = "1.9.10";
+    /// <summary>
+    /// 本迁移版自身的版本（显示用）。
+    ///
+    /// 单一真源 = <c>Migrator.csproj</c> 的 <c>&lt;Version&gt;</c>（CI 用 <c>-p:Version=</c> 覆盖同一个值），
+    /// 从程序集读回来，避免像 v1.9.10 那样版本号写死在两处、改一处漏一处。
+    /// </summary>
+    public static string MigratorVersion { get; } =
+        typeof(MigratePaths).Assembly.GetName().Version is { } v ? v.ToString(3) : "0.0.0";
 }
