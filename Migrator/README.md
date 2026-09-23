@@ -58,7 +58,7 @@ ClipboardX.exe --demo-scale 150
 
 ```
 === ClipboardX 迁移版 launcher 现状 ===
-launcher 版本      : 1.9.11
+launcher 版本      : 1.9.12
 显示器（各屏实测 DPI，launcher 声明 PerMonitorV2，这里是真值）：
   2880x1920 @(0,0)  DPI=192（200%）  主屏
   1920x1080 @(2880,-1)  DPI=96（100%）
@@ -72,7 +72,7 @@ clipx 是否已安装   : True
 ```
 
 > `--demo-scale` 的字号按「目标 DPI ÷ 当前显示器 DPI」折算，所以它在**任意**缩放的开发机上都准确，
-> 不会与开发机自身的 DPI 叠加。校准数据见 CHANGELOG 的 Unreleased 段。
+> 不会与开发机自身的 DPI 叠加。校准数据见 CHANGELOG 的 v1.9.12 段。
 
 ## 已知边界
 

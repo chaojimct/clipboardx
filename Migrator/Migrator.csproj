@@ -23,7 +23,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <RootNamespace>ClipboardX.Migrator</RootNamespace>
     <AssemblyName>ClipboardX</AssemblyName>
-    <Version>1.9.11</Version>
+    <Version>1.9.12</Version>
     <Product>ClipboardX 迁移向导</Product>
     <Company>ClipboardX</Company>
     <RepositoryUrl>https://github.com/chaojimct/clipboardx</RepositoryUrl>

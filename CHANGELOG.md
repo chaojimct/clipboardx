@@ -4,7 +4,7 @@
 
 格式依据 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 的常见写法；日期为发布日（与 tag 推送日一致即可）。
 
-## [Unreleased]
+## [1.9.12] - 2026-09-23
 
 ### 自检工具（只影响排障，不影响用户可见功能）
 
